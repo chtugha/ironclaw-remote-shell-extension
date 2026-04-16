@@ -7,7 +7,7 @@
       "action"
     ],
     "conditional_requirements": [
-      "`connect` requires `host`, `username`, and `auth`.",
+      "`connect` requires `host`, `username`, `auth`, and either `host_key_fingerprint` (SHA256:... for MITM protection, obtain with: ssh-keyscan <host> | ssh-keygen -lf -) or `insecure_ignore_host_key: true` (skips verification, only for trusted networks).",
       "`execute` requires `session_id` and `command`.",
       "`disconnect` requires `session_id`.",
       "`list_sessions` has no additional requirements."
@@ -23,7 +23,8 @@
         "action": "connect",
         "host": "server.example.com",
         "username": "deploy",
-        "auth": { "type": "password", "password": "..." }
+        "auth": { "type": "password", "password": "..." },
+        "host_key_fingerprint": "SHA256:..."
       },
       {
         "action": "execute",

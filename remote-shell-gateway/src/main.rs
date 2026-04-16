@@ -354,12 +354,22 @@ async fn handle_connect(
     {
         let mut sessions = state.sessions.write().await;
         if sessions.contains_key(&session_id) {
+            drop(sessions);
+            let _ = session
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
             return error_json(
                 StatusCode::CONFLICT,
                 format!("Session '{}' already exists. Disconnect it first or use a different session_id.", session_id),
             );
         }
         if sessions.len() >= state.max_sessions {
+            drop(sessions);
+            let _ = session
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
             return error_json(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
