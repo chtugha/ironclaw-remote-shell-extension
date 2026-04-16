@@ -41,3 +41,14 @@ Two-component extension following ironclaw's WASM tool pattern:
 - 20 tests pass (14 WASM tool + 6 gateway)
 - cargo clippy clean (no warnings)
 - cargo fmt applied
+
+### [x] Step: Security hardening
+- Host key verification: require `host_key_fingerprint` or explicit `insecure_ignore_host_key: true` (issue #1)
+- Bearer token auth middleware on all protected endpoints via `SSH_GATEWAY_TOKEN` env var (issue #2)
+- Exit code capture via `channel.wait()` + `ChannelMsg::ExitStatus` instead of `into_stream()` (issue #3)
+- stderr capture via `ChannelMsg::ExtendedData` (issue #4)
+- Lock not held during command execution: sessions wrapped in `Arc`, cloned out before I/O (issue #5)
+- Session collision rejected with HTTP 409 Conflict (issue #6)
+- Removed redundant pre-flight health checks from WASM tool (issue #7)
+- Session TTL + max session count enforced (issue #8)
+- 22 tests pass (14 WASM tool + 8 gateway), clippy clean, fmt clean

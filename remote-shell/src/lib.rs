@@ -183,17 +183,6 @@ fn gateway_request(
     }
 }
 
-fn check_gateway_reachable(gateway_port: Option<u16>) -> Result<(), String> {
-    gateway_request("GET", "/health", None, gateway_port).map(|_| ())
-        .map_err(|_| {
-            let port = gateway_port.unwrap_or(DEFAULT_GATEWAY_PORT);
-            format!(
-                "SSH gateway not reachable at 127.0.0.1:{}. Start it with: remote-shell-gateway --port {}",
-                port, port
-            )
-        })
-}
-
 impl exports::near::agent::tool::Guest for RemoteShellTool {
     fn execute(req: exports::near::agent::tool::Request) -> exports::near::agent::tool::Response {
         match execute_inner(&req.params) {
@@ -236,7 +225,6 @@ fn execute_inner(params: &str) -> Result<String, String> {
         } => {
             validate_hostname(&host)?;
             validate_input_length(&username, "username")?;
-            check_gateway_reachable(gateway_port)?;
 
             let gw_req = GatewayConnectRequest {
                 session_id,
@@ -258,7 +246,6 @@ fn execute_inner(params: &str) -> Result<String, String> {
         } => {
             validate_input_length(&session_id, "session_id")?;
             validate_command(&command)?;
-            check_gateway_reachable(gateway_port)?;
 
             let gw_req = GatewayExecuteRequest {
                 session_id,
@@ -275,7 +262,6 @@ fn execute_inner(params: &str) -> Result<String, String> {
             gateway_port,
         } => {
             validate_input_length(&session_id, "session_id")?;
-            check_gateway_reachable(gateway_port)?;
 
             let gw_req = GatewayDisconnectRequest { session_id };
             let body = serde_json::to_string(&gw_req)
@@ -284,7 +270,6 @@ fn execute_inner(params: &str) -> Result<String, String> {
         }
 
         RemoteShellAction::ListSessions { gateway_port } => {
-            check_gateway_reachable(gateway_port)?;
             gateway_request("GET", "/sessions", None, gateway_port)
         }
     }

@@ -1,20 +1,25 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::extract::{Json, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use clap::Parser;
 use russh::client;
+use russh::ChannelMsg;
 use russh_keys::key::PrivateKeyWithHashAlg;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+const DEFAULT_MAX_SESSIONS: usize = 64;
+const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
 
 #[derive(Parser)]
 #[command(
@@ -27,11 +32,20 @@ struct Cli {
 
     #[arg(long, default_value = "9022")]
     port: u16,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_SESSIONS)]
+    max_sessions: usize,
+
+    #[arg(long, default_value_t = DEFAULT_SESSION_TTL_SECS)]
+    session_ttl_secs: u64,
 }
 
 #[derive(Clone)]
 struct AppState {
-    sessions: Arc<RwLock<HashMap<String, SshSession>>>,
+    sessions: Arc<RwLock<HashMap<String, Arc<SshSession>>>>,
+    bearer_token: Option<String>,
+    max_sessions: usize,
+    session_ttl: Duration,
 }
 
 struct SshSession {
@@ -39,9 +53,12 @@ struct SshSession {
     host: String,
     port: u16,
     username: String,
+    created_at: Instant,
 }
 
-struct SshHandler;
+struct SshHandler {
+    expected_fingerprint: Option<String>,
+}
 
 #[async_trait::async_trait]
 impl client::Handler for SshHandler {
@@ -49,9 +66,28 @@ impl client::Handler for SshHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &ssh_key::PublicKey,
+        server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        match &self.expected_fingerprint {
+            Some(expected) => {
+                let fp = server_public_key.fingerprint(ssh_key::HashAlg::Sha256);
+                let actual = fp.to_string();
+                if actual == *expected {
+                    Ok(true)
+                } else {
+                    error!(
+                        expected = %expected,
+                        actual = %actual,
+                        "host key fingerprint mismatch"
+                    );
+                    Ok(false)
+                }
+            }
+            None => {
+                warn!("host key verification skipped — insecure_ignore_host_key was set");
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -63,6 +99,9 @@ struct ConnectRequest {
     username: String,
     #[serde(default)]
     auth: AuthMethod,
+    host_key_fingerprint: Option<String>,
+    #[serde(default)]
+    insecure_ignore_host_key: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +160,7 @@ struct SessionInfo {
     host: String,
     port: u16,
     username: String,
+    age_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -133,14 +173,98 @@ struct MessageResponse {
     message: String,
 }
 
+fn error_json(status: StatusCode, msg: String) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::to_value(ErrorResponse { error: msg }).expect("serialize error")),
+    )
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> impl IntoResponse {
+    if let Some(expected) = &state.bearer_token {
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match provided {
+            Some(token) if token == expected.as_str() => {}
+            _ => {
+                return error_json(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid or missing bearer token".into(),
+                )
+                .into_response();
+            }
+        }
+    }
+    next.run(request).await.into_response()
+}
+
+async fn reap_expired_sessions(state: &AppState) {
+    let mut sessions = state.sessions.write().await;
+    let before = sessions.len();
+    sessions.retain(|id, s| {
+        let alive = s.created_at.elapsed() < state.session_ttl;
+        if !alive {
+            info!(session_id = %id, "session expired, reaping");
+        }
+        alive
+    });
+    let reaped = before - sessions.len();
+    if reaped > 0 {
+        debug!(reaped, "expired sessions reaped");
+    }
+}
+
 async fn handle_connect(
     State(state): State<AppState>,
     Json(req): Json<ConnectRequest>,
 ) -> impl IntoResponse {
+    reap_expired_sessions(&state).await;
+
     let session_id = req
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let port = req.port.unwrap_or(22);
+
+    {
+        let sessions = state.sessions.read().await;
+        if sessions.contains_key(&session_id) {
+            return error_json(
+                StatusCode::CONFLICT,
+                format!("Session '{}' already exists. Disconnect it first or use a different session_id.", session_id),
+            );
+        }
+        if sessions.len() >= state.max_sessions {
+            return error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Maximum number of sessions ({}) reached. Disconnect unused sessions first.",
+                    state.max_sessions
+                ),
+            );
+        }
+    }
+
+    let expected_fingerprint = if req.insecure_ignore_host_key {
+        warn!(host = %req.host, "connecting with host key verification DISABLED — vulnerable to MITM");
+        None
+    } else if let Some(fp) = req.host_key_fingerprint {
+        Some(fp)
+    } else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "Either 'host_key_fingerprint' must be provided for secure connections, \
+             or 'insecure_ignore_host_key' must be set to true. \
+             Get the fingerprint with: ssh-keyscan <host> | ssh-keygen -lf -"
+                .into(),
+        );
+    };
 
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(300)),
@@ -152,19 +276,17 @@ async fn handle_connect(
     let addr = format!("{}:{}", req.host, port);
     debug!(addr = %addr, "connecting to SSH server");
 
-    let handler = SshHandler;
+    let handler = SshHandler {
+        expected_fingerprint: expected_fingerprint.clone(),
+    };
+
     let mut handle = match client::connect(config, &addr, handler).await {
         Ok(h) => h,
         Err(e) => {
             error!(error = %e, "SSH connection failed");
-            return (
+            return error_json(
                 StatusCode::BAD_GATEWAY,
-                Json(
-                    serde_json::to_value(ErrorResponse {
-                        error: format!("SSH connection failed: {e}"),
-                    })
-                    .expect("serialize error"),
-                ),
+                format!("SSH connection failed: {e}"),
             );
         }
     };
@@ -181,14 +303,9 @@ async fn handle_connect(
                 Ok(k) => k,
                 Err(e) => {
                     error!(error = %e, "failed to decode private key");
-                    return (
+                    return error_json(
                         StatusCode::BAD_REQUEST,
-                        Json(
-                            serde_json::to_value(ErrorResponse {
-                                error: format!("Invalid private key: {e}"),
-                            })
-                            .expect("serialize error"),
-                        ),
+                        format!("Invalid private key: {e}"),
                     );
                 }
             };
@@ -196,14 +313,9 @@ async fn handle_connect(
                 Ok(k) => k,
                 Err(e) => {
                     error!(error = %e, "failed to prepare private key");
-                    return (
+                    return error_json(
                         StatusCode::BAD_REQUEST,
-                        Json(
-                            serde_json::to_value(ErrorResponse {
-                                error: format!("Failed to prepare private key: {e}"),
-                            })
-                            .expect("serialize error"),
-                        ),
+                        format!("Failed to prepare private key: {e}"),
                     );
                 }
             };
@@ -216,36 +328,27 @@ async fn handle_connect(
     match auth_result {
         Ok(true) => {}
         Ok(false) => {
-            return (
+            return error_json(
                 StatusCode::UNAUTHORIZED,
-                Json(
-                    serde_json::to_value(ErrorResponse {
-                        error: "Authentication failed: credentials rejected".into(),
-                    })
-                    .expect("serialize error"),
-                ),
+                "Authentication failed: credentials rejected".into(),
             );
         }
         Err(e) => {
             error!(error = %e, "SSH authentication error");
-            return (
+            return error_json(
                 StatusCode::UNAUTHORIZED,
-                Json(
-                    serde_json::to_value(ErrorResponse {
-                        error: format!("Authentication error: {e}"),
-                    })
-                    .expect("serialize error"),
-                ),
+                format!("Authentication error: {e}"),
             );
         }
     }
 
-    let session = SshSession {
+    let session = Arc::new(SshSession {
         handle,
         host: req.host.clone(),
         port,
         username: req.username.clone(),
-    };
+        created_at: Instant::now(),
+    });
 
     state
         .sessions
@@ -271,74 +374,79 @@ async fn handle_execute(
     State(state): State<AppState>,
     Json(req): Json<ExecuteRequest>,
 ) -> impl IntoResponse {
-    let sessions = state.sessions.read().await;
-    let session = match sessions.get(&req.session_id) {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(
-                    serde_json::to_value(ErrorResponse {
-                        error: format!("Session '{}' not found", req.session_id),
-                    })
-                    .expect("serialize error"),
-                ),
-            );
+    let session = {
+        let sessions = state.sessions.read().await;
+        match sessions.get(&req.session_id) {
+            Some(s) => {
+                if s.created_at.elapsed() >= state.session_ttl {
+                    drop(sessions);
+                    let mut sessions = state.sessions.write().await;
+                    sessions.remove(&req.session_id);
+                    return error_json(
+                        StatusCode::GONE,
+                        format!("Session '{}' has expired", req.session_id),
+                    );
+                }
+                Arc::clone(s)
+            }
+            None => {
+                return error_json(
+                    StatusCode::NOT_FOUND,
+                    format!("Session '{}' not found", req.session_id),
+                );
+            }
         }
     };
 
-    let channel = match session.handle.channel_open_session().await {
+    let mut channel = match session.handle.channel_open_session().await {
         Ok(ch) => ch,
         Err(e) => {
             error!(error = %e, "failed to open channel");
-            return (
+            return error_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::to_value(ErrorResponse {
-                        error: format!("Failed to open SSH channel: {e}"),
-                    })
-                    .expect("serialize error"),
-                ),
+                format!("Failed to open SSH channel: {e}"),
             );
         }
     };
 
     if let Err(e) = channel.exec(true, req.command.as_bytes()).await {
         error!(error = %e, "failed to execute command");
-        return (
+        return error_json(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::to_value(ErrorResponse {
-                    error: format!("Failed to execute command: {e}"),
-                })
-                .expect("serialize error"),
-            ),
+            format!("Failed to execute command: {e}"),
         );
     }
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let exit_code: Option<u32> = None;
+    let mut exit_code: Option<u32> = None;
 
     let timeout = Duration::from_secs(req.timeout_secs);
-    let result = tokio::time::timeout(timeout, async {
-        let mut stream = channel.into_stream();
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 8192];
-        loop {
-            match stream.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => stdout.extend_from_slice(&buf[..n]),
-                Err(e) => {
-                    stderr.extend_from_slice(format!("Read error: {e}").as_bytes());
+    let timed_out = tokio::time::timeout(timeout, async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
+                    stdout.extend_from_slice(&data);
+                }
+                ChannelMsg::ExtendedData { data, ext } => {
+                    if ext == 1 {
+                        stderr.extend_from_slice(&data);
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status } => {
+                    exit_code = Some(exit_status);
+                }
+                ChannelMsg::Eof | ChannelMsg::Close => {
                     break;
                 }
+                _ => {}
             }
         }
     })
-    .await;
+    .await
+    .is_err();
 
-    if result.is_err() {
+    if timed_out {
         stderr.extend_from_slice(b"\n[timeout: command exceeded time limit]");
     }
 
@@ -387,14 +495,9 @@ async fn handle_disconnect(
                 ),
             )
         }
-        None => (
+        None => error_json(
             StatusCode::NOT_FOUND,
-            Json(
-                serde_json::to_value(ErrorResponse {
-                    error: format!("Session '{}' not found", req.session_id),
-                })
-                .expect("serialize error"),
-            ),
+            format!("Session '{}' not found", req.session_id),
         ),
     }
 }
@@ -408,6 +511,7 @@ async fn handle_list_sessions(State(state): State<AppState>) -> impl IntoRespons
             host: s.host.clone(),
             port: s.port,
             username: s.username.clone(),
+            age_secs: s.created_at.elapsed().as_secs(),
         })
         .collect();
 
@@ -429,16 +533,35 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    let bearer_token = std::env::var("SSH_GATEWAY_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    if bearer_token.is_some() {
+        info!("bearer token authentication enabled");
+    } else {
+        warn!("no SSH_GATEWAY_TOKEN set — gateway is unauthenticated, only bind to localhost");
+    }
+
     let state = AppState {
         sessions: Arc::new(RwLock::new(HashMap::new())),
+        bearer_token,
+        max_sessions: cli.max_sessions,
+        session_ttl: Duration::from_secs(cli.session_ttl_secs),
     };
 
-    let app = Router::new()
-        .route("/health", get(handle_health))
+    let protected = Router::new()
         .route("/sessions", get(handle_list_sessions))
         .route("/connect", post(handle_connect))
         .route("/execute", post(handle_execute))
         .route("/disconnect", delete(handle_disconnect))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(handle_health))
+        .merge(protected)
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
@@ -468,13 +591,29 @@ mod tests {
         let json = r#"{
             "host": "example.com",
             "username": "deploy",
-            "auth": { "type": "password", "password": "secret123" }
+            "auth": { "type": "password", "password": "secret123" },
+            "insecure_ignore_host_key": true
         }"#;
         let req: ConnectRequest = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(req.host, "example.com");
         assert_eq!(req.username, "deploy");
         assert!(req.port.is_none());
         assert!(req.session_id.is_none());
+        assert!(req.insecure_ignore_host_key);
+        assert!(req.host_key_fingerprint.is_none());
+    }
+
+    #[test]
+    fn test_connect_request_with_fingerprint() {
+        let json = r#"{
+            "host": "example.com",
+            "username": "deploy",
+            "auth": { "type": "password", "password": "secret123" },
+            "host_key_fingerprint": "SHA256:abcdef123456"
+        }"#;
+        let req: ConnectRequest = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(req.host_key_fingerprint, Some("SHA256:abcdef123456".into()));
+        assert!(!req.insecure_ignore_host_key);
     }
 
     #[test]
@@ -484,7 +623,8 @@ mod tests {
             "port": 2222,
             "username": "admin",
             "session_id": "my-session",
-            "auth": { "type": "private_key", "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----" }
+            "auth": { "type": "private_key", "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----" },
+            "insecure_ignore_host_key": true
         }"#;
         let req: ConnectRequest = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(req.port, Some(2222));
@@ -522,9 +662,22 @@ mod tests {
             host: "10.0.0.1".into(),
             port: 22,
             username: "root".into(),
+            age_secs: 42,
         };
         let json = serde_json::to_string(&info).expect("should serialize");
         assert!(json.contains("test-id"));
         assert!(json.contains("10.0.0.1"));
+        assert!(json.contains("\"age_secs\":42"));
+    }
+
+    #[test]
+    fn test_connect_request_defaults() {
+        let json = r#"{
+            "host": "example.com",
+            "username": "user"
+        }"#;
+        let req: ConnectRequest = serde_json::from_str(json).expect("should deserialize");
+        assert!(!req.insecure_ignore_host_key);
+        assert!(req.host_key_fingerprint.is_none());
     }
 }
