@@ -11,6 +11,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use clap::Parser;
+use constant_time_eq::constant_time_eq;
 use russh::client;
 use russh::ChannelMsg;
 use russh_keys::key::PrivateKeyWithHashAlg;
@@ -192,7 +193,7 @@ async fn auth_middleware(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         match provided {
-            Some(token) if token == expected.as_str() => {}
+            Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {}
             _ => {
                 return error_json(
                     StatusCode::UNAUTHORIZED,
@@ -350,11 +351,25 @@ async fn handle_connect(
         created_at: Instant::now(),
     });
 
-    state
-        .sessions
-        .write()
-        .await
-        .insert(session_id.clone(), session);
+    {
+        let mut sessions = state.sessions.write().await;
+        if sessions.contains_key(&session_id) {
+            return error_json(
+                StatusCode::CONFLICT,
+                format!("Session '{}' already exists. Disconnect it first or use a different session_id.", session_id),
+            );
+        }
+        if sessions.len() >= state.max_sessions {
+            return error_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Maximum number of sessions ({}) reached. Disconnect unused sessions first.",
+                    state.max_sessions
+                ),
+            );
+        }
+        sessions.insert(session_id.clone(), session);
+    }
 
     info!(session_id = %session_id, host = %req.host, "SSH session established");
 

@@ -51,6 +51,9 @@ enum RemoteShellAction {
         #[serde(default)]
         auth: AuthMethod,
         session_id: Option<String>,
+        host_key_fingerprint: Option<String>,
+        #[serde(default)]
+        insecure_ignore_host_key: bool,
         gateway_port: Option<u16>,
     },
 
@@ -99,6 +102,9 @@ struct GatewayConnectRequest {
     port: Option<u16>,
     username: String,
     auth: GatewayAuthMethod,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_key_fingerprint: Option<String>,
+    insecure_ignore_host_key: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,6 +227,8 @@ fn execute_inner(params: &str) -> Result<String, String> {
             username,
             auth,
             session_id,
+            host_key_fingerprint,
+            insecure_ignore_host_key,
             gateway_port,
         } => {
             validate_hostname(&host)?;
@@ -232,6 +240,8 @@ fn execute_inner(params: &str) -> Result<String, String> {
                 port,
                 username,
                 auth: auth.into(),
+                host_key_fingerprint,
+                insecure_ignore_host_key,
             };
             let body = serde_json::to_string(&gw_req)
                 .map_err(|e| format!("Failed to serialize request: {e}"))?;
@@ -308,6 +318,8 @@ const SCHEMA: &str = r#"{
                     "description": "Authentication method"
                 },
                 "session_id": { "type": "string", "description": "Optional session identifier (auto-generated if omitted)" },
+                "host_key_fingerprint": { "type": "string", "description": "SSH host key fingerprint for verification (e.g. SHA256:...). Obtain with: ssh-keyscan <host> | ssh-keygen -lf -" },
+                "insecure_ignore_host_key": { "type": "boolean", "description": "Skip host key verification (INSECURE, vulnerable to MITM). Only use for trusted networks.", "default": false },
                 "gateway_port": { "type": "integer", "description": "SSH gateway port (default: 9022)" }
             },
             "required": ["action", "host", "username", "auth"]
@@ -412,13 +424,45 @@ mod tests {
             "action": "connect",
             "host": "server.example.com",
             "username": "deploy",
-            "auth": { "type": "password", "password": "s3cret" }
+            "auth": { "type": "password", "password": "s3cret" },
+            "insecure_ignore_host_key": true
         }"#;
         let action: RemoteShellAction = serde_json::from_str(json).expect("should deserialize");
         match action {
-            RemoteShellAction::Connect { host, username, .. } => {
+            RemoteShellAction::Connect {
+                host,
+                username,
+                insecure_ignore_host_key,
+                host_key_fingerprint,
+                ..
+            } => {
                 assert_eq!(host, "server.example.com");
                 assert_eq!(username, "deploy");
+                assert!(insecure_ignore_host_key);
+                assert!(host_key_fingerprint.is_none());
+            }
+            _ => panic!("expected Connect action"),
+        }
+    }
+
+    #[test]
+    fn test_connect_with_fingerprint() {
+        let json = r#"{
+            "action": "connect",
+            "host": "server.example.com",
+            "username": "deploy",
+            "auth": { "type": "password", "password": "s3cret" },
+            "host_key_fingerprint": "SHA256:abc123"
+        }"#;
+        let action: RemoteShellAction = serde_json::from_str(json).expect("should deserialize");
+        match action {
+            RemoteShellAction::Connect {
+                host_key_fingerprint,
+                insecure_ignore_host_key,
+                ..
+            } => {
+                assert_eq!(host_key_fingerprint, Some("SHA256:abc123".into()));
+                assert!(!insecure_ignore_host_key);
             }
             _ => panic!("expected Connect action"),
         }
@@ -435,7 +479,8 @@ mod tests {
             "auth": {
                 "type": "private_key",
                 "key_pem": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
-            }
+            },
+            "insecure_ignore_host_key": true
         }"#;
         let action: RemoteShellAction = serde_json::from_str(json).expect("should deserialize");
         match action {
@@ -531,6 +576,40 @@ mod tests {
             }
             _ => panic!("expected PrivateKey"),
         }
+    }
+
+    #[test]
+    fn test_gateway_connect_request_includes_host_key_fields() {
+        let req = GatewayConnectRequest {
+            session_id: None,
+            host: "example.com".into(),
+            port: None,
+            username: "user".into(),
+            auth: GatewayAuthMethod::Password {
+                password: "pass".into(),
+            },
+            host_key_fingerprint: Some("SHA256:xyz".into()),
+            insecure_ignore_host_key: false,
+        };
+        let json = serde_json::to_string(&req).expect("should serialize");
+        assert!(json.contains("host_key_fingerprint"));
+        assert!(json.contains("SHA256:xyz"));
+        assert!(json.contains("insecure_ignore_host_key"));
+
+        let req2 = GatewayConnectRequest {
+            session_id: None,
+            host: "example.com".into(),
+            port: None,
+            username: "user".into(),
+            auth: GatewayAuthMethod::Password {
+                password: "pass".into(),
+            },
+            host_key_fingerprint: None,
+            insecure_ignore_host_key: true,
+        };
+        let json2 = serde_json::to_string(&req2).expect("should serialize");
+        assert!(!json2.contains("host_key_fingerprint"));
+        assert!(json2.contains("\"insecure_ignore_host_key\":true"));
     }
 
     #[test]

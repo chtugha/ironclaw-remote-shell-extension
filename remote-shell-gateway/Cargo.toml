@@ -12,6 +12,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+constant_time_eq = "0.3"
 russh = "0.49"
 russh-keys = "0.49"
 ssh-key = "0.6"
