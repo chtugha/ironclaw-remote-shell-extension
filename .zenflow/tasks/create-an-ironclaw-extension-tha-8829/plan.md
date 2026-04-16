@@ -52,3 +52,14 @@ Two-component extension following ironclaw's WASM tool pattern:
 - Removed redundant pre-flight health checks from WASM tool (issue #7)
 - Session TTL + max session count enforced (issue #8)
 - 22 tests pass (14 WASM tool + 8 gateway), clippy clean, fmt clean
+
+### [x] Step: Codebase audit and fixes
+- BUG: Fixed Eof breaking channel read loop before ExitStatus arrives (SSH sends Eof→ExitStatus→Close)
+- BUG: Fixed reap_expired_sessions dropping sessions without calling disconnect() — leaked remote SSH connections
+- BUG: Fixed handle_disconnect holding write lock during async disconnect I/O — blocked all concurrent operations
+- SECURITY: Added 10MB output buffer cap on stdout/stderr to prevent OOM from large command output
+- SECURITY: Added gateway-side input validation (host, username, session_id, command lengths; timeout bounds 1-3600s)
+- Removed unused dependencies: base64, thiserror
+- Extracted all magic numbers to named constants (SSH config, HTTP timeout, buffer limits, port defaults)
+- Removed unnecessary .clone() on expected_fingerprint
+- 24 tests pass (16 WASM tool + 8 gateway), clippy clean, fmt clean

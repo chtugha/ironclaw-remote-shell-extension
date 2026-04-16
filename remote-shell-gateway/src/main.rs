@@ -21,6 +21,15 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_MAX_SESSIONS: usize = 64;
 const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
+const DEFAULT_SSH_PORT: u16 = 22;
+const SSH_INACTIVITY_TIMEOUT_SECS: u64 = 300;
+const SSH_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+const SSH_KEEPALIVE_MAX: usize = 3;
+const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+const MIN_TIMEOUT_SECS: u64 = 1;
+const MAX_TIMEOUT_SECS: u64 = 3600;
+const MAX_INPUT_LENGTH: usize = 65536;
+const MAX_HOSTNAME_LENGTH: usize = 253;
 
 #[derive(Parser)]
 #[command(
@@ -133,8 +142,10 @@ struct ExecuteRequest {
     timeout_secs: u64,
 }
 
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
+
 fn default_timeout() -> u64 {
-    30
+    DEFAULT_COMMAND_TIMEOUT_SECS
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,18 +218,25 @@ async fn auth_middleware(
 }
 
 async fn reap_expired_sessions(state: &AppState) {
-    let mut sessions = state.sessions.write().await;
-    let before = sessions.len();
-    sessions.retain(|id, s| {
-        let alive = s.created_at.elapsed() < state.session_ttl;
-        if !alive {
-            info!(session_id = %id, "session expired, reaping");
-        }
-        alive
-    });
-    let reaped = before - sessions.len();
-    if reaped > 0 {
-        debug!(reaped, "expired sessions reaped");
+    let expired: Vec<(String, Arc<SshSession>)> = {
+        let mut sessions = state.sessions.write().await;
+        let mut expired = Vec::new();
+        sessions.retain(|id, s| {
+            let alive = s.created_at.elapsed() < state.session_ttl;
+            if !alive {
+                info!(session_id = %id, "session expired, reaping");
+                expired.push((id.clone(), Arc::clone(s)));
+            }
+            alive
+        });
+        expired
+    };
+    for (id, session) in &expired {
+        let _ = session
+            .handle
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+        debug!(session_id = %id, "expired session disconnected");
     }
 }
 
@@ -231,7 +249,26 @@ async fn handle_connect(
     let session_id = req
         .session_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let port = req.port.unwrap_or(22);
+    let port = req.port.unwrap_or(DEFAULT_SSH_PORT);
+
+    if req.host.is_empty() || req.host.len() > MAX_HOSTNAME_LENGTH {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("Hostname must be 1-{MAX_HOSTNAME_LENGTH} characters"),
+        );
+    }
+    if req.host.contains(' ') || req.host.contains('\n') || req.host.contains('\r') {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "Hostname contains invalid characters".into(),
+        );
+    }
+    if req.username.is_empty() || req.username.len() > MAX_INPUT_LENGTH {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "Username must be 1-65536 characters".into(),
+        );
+    }
 
     {
         let sessions = state.sessions.read().await;
@@ -268,9 +305,9 @@ async fn handle_connect(
     };
 
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(300)),
-        keepalive_interval: Some(Duration::from_secs(30)),
-        keepalive_max: 3,
+        inactivity_timeout: Some(Duration::from_secs(SSH_INACTIVITY_TIMEOUT_SECS)),
+        keepalive_interval: Some(Duration::from_secs(SSH_KEEPALIVE_INTERVAL_SECS)),
+        keepalive_max: SSH_KEEPALIVE_MAX,
         ..Default::default()
     });
 
@@ -278,7 +315,7 @@ async fn handle_connect(
     debug!(addr = %addr, "connecting to SSH server");
 
     let handler = SshHandler {
-        expected_fingerprint: expected_fingerprint.clone(),
+        expected_fingerprint,
     };
 
     let mut handle = match client::connect(config, &addr, handler).await {
@@ -399,6 +436,22 @@ async fn handle_execute(
     State(state): State<AppState>,
     Json(req): Json<ExecuteRequest>,
 ) -> impl IntoResponse {
+    if req.session_id.is_empty() || req.session_id.len() > MAX_INPUT_LENGTH {
+        return error_json(StatusCode::BAD_REQUEST, "Invalid session_id length".into());
+    }
+    if req.command.is_empty() || req.command.len() > MAX_INPUT_LENGTH {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("Command must be 1-{MAX_INPUT_LENGTH} characters"),
+        );
+    }
+    if req.timeout_secs < MIN_TIMEOUT_SECS || req.timeout_secs > MAX_TIMEOUT_SECS {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("timeout_secs must be {MIN_TIMEOUT_SECS}-{MAX_TIMEOUT_SECS}"),
+        );
+    }
+
     let session = {
         let sessions = state.sessions.read().await;
         match sessions.get(&req.session_id) {
@@ -445,23 +498,38 @@ async fn handle_execute(
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_code: Option<u32> = None;
+    let mut truncated = false;
 
     let timeout = Duration::from_secs(req.timeout_secs);
     let timed_out = tokio::time::timeout(timeout, async {
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { data } => {
-                    stdout.extend_from_slice(&data);
+                    let remaining = MAX_OUTPUT_BYTES.saturating_sub(stdout.len());
+                    if remaining > 0 {
+                        let take = data.len().min(remaining);
+                        stdout.extend_from_slice(&data[..take]);
+                        if take < data.len() {
+                            truncated = true;
+                        }
+                    }
                 }
                 ChannelMsg::ExtendedData { data, ext } => {
                     if ext == 1 {
-                        stderr.extend_from_slice(&data);
+                        let remaining = MAX_OUTPUT_BYTES.saturating_sub(stderr.len());
+                        if remaining > 0 {
+                            let take = data.len().min(remaining);
+                            stderr.extend_from_slice(&data[..take]);
+                            if take < data.len() {
+                                truncated = true;
+                            }
+                        }
                     }
                 }
                 ChannelMsg::ExitStatus { exit_status } => {
                     exit_code = Some(exit_status);
                 }
-                ChannelMsg::Eof | ChannelMsg::Close => {
+                ChannelMsg::Close => {
                     break;
                 }
                 _ => {}
@@ -473,6 +541,9 @@ async fn handle_execute(
 
     if timed_out {
         stderr.extend_from_slice(b"\n[timeout: command exceeded time limit]");
+    }
+    if truncated {
+        stderr.extend_from_slice(b"\n[warning: output truncated at 10MB limit]");
     }
 
     let stdout_str = String::from_utf8_lossy(&stdout).to_string();
@@ -502,8 +573,14 @@ async fn handle_disconnect(
     State(state): State<AppState>,
     Json(req): Json<DisconnectRequest>,
 ) -> impl IntoResponse {
-    let mut sessions = state.sessions.write().await;
-    match sessions.remove(&req.session_id) {
+    if req.session_id.is_empty() || req.session_id.len() > MAX_INPUT_LENGTH {
+        return error_json(StatusCode::BAD_REQUEST, "Invalid session_id length".into());
+    }
+    let session = {
+        let mut sessions = state.sessions.write().await;
+        sessions.remove(&req.session_id)
+    };
+    match session {
         Some(session) => {
             let _ = session
                 .handle

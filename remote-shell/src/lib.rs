@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 const MAX_TEXT_LENGTH: usize = 65536;
 const DEFAULT_GATEWAY_PORT: u16 = 9022;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const HTTP_TIMEOUT_MS: u32 = 60000;
 
 fn validate_input_length(s: &str, field_name: &str) -> Result<(), String> {
     if s.len() > MAX_TEXT_LENGTH {
@@ -172,7 +174,7 @@ fn gateway_request(
         &url,
         &headers.to_string(),
         body_bytes.as_deref(),
-        Some(60000),
+        Some(HTTP_TIMEOUT_MS),
     )
     .map_err(|e| format!("Gateway request failed: {e}"))?;
 
@@ -260,7 +262,7 @@ fn execute_inner(params: &str) -> Result<String, String> {
             let gw_req = GatewayExecuteRequest {
                 session_id,
                 command,
-                timeout_secs: timeout_secs.unwrap_or(30),
+                timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
             };
             let body = serde_json::to_string(&gw_req)
                 .map_err(|e| format!("Failed to serialize request: {e}"))?;
