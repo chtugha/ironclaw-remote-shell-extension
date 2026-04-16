@@ -1,0 +1,93 @@
+{
+  "version": "0.1.0",
+  "wit_version": "0.3.0",
+  "description": "Connect to remote machines via SSH and execute commands. Manages persistent SSH sessions through a local gateway service. Supports password and private key authentication.",
+  "discovery_summary": {
+    "always_required": [
+      "action"
+    ],
+    "conditional_requirements": [
+      "`connect` requires `host`, `username`, and `auth`.",
+      "`execute` requires `session_id` and `command`.",
+      "`disconnect` requires `session_id`.",
+      "`list_sessions` has no additional requirements."
+    ],
+    "notes": [
+      "The SSH gateway service (`remote-shell-gateway`) must be running locally before using this tool.",
+      "Default gateway port is 9022. Override with the `gateway_port` parameter.",
+      "Sessions persist until explicitly disconnected or the gateway is restarted.",
+      "Use `tool_info(name: \"remote_shell\", detail: \"schema\")` for the full action schema."
+    ],
+    "examples": [
+      {
+        "action": "connect",
+        "host": "server.example.com",
+        "username": "deploy",
+        "auth": { "type": "password", "password": "..." }
+      },
+      {
+        "action": "execute",
+        "session_id": "abc-123",
+        "command": "uptime"
+      },
+      {
+        "action": "list_sessions"
+      },
+      {
+        "action": "disconnect",
+        "session_id": "abc-123"
+      }
+    ]
+  },
+  "capabilities": {
+    "http": {
+      "allowlist": [
+        {
+          "host": "127.0.0.1",
+          "path_prefix": "/",
+          "methods": ["GET", "POST", "DELETE"]
+        }
+      ],
+      "credentials": {
+        "ssh_gateway_token": {
+          "secret_name": "ssh_gateway_token",
+          "location": {
+            "type": "header",
+            "name": "Authorization",
+            "prefix": "Bearer "
+          },
+          "host_patterns": ["127.0.0.1"]
+        }
+      },
+      "rate_limit": {
+        "requests_per_minute": 60,
+        "requests_per_hour": 1000
+      }
+    },
+    "secrets": {
+      "allowed_names": [
+        "ssh_gateway_token",
+        "ssh_*"
+      ]
+    }
+  },
+  "auth": {
+    "secret_name": "ssh_gateway_token",
+    "display_name": "SSH Gateway",
+    "instructions": "The remote-shell-gateway service must be running. If you configured a bearer token for the gateway, enter it here. Otherwise, leave empty or set any value.",
+    "token_hint": "Optional bearer token for the gateway API",
+    "env_var": "SSH_GATEWAY_TOKEN"
+  },
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "ssh_gateway_token",
+        "prompt": "SSH gateway bearer token (optional, press Enter to skip)"
+      }
+    ]
+  },
+  "config": {
+    "default_gateway_port": 9022,
+    "default_timeout_secs": 30
+  }
+}
