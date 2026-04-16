@@ -509,9 +509,9 @@ async fn handle_execute(
                     if remaining > 0 {
                         let take = data.len().min(remaining);
                         stdout.extend_from_slice(&data[..take]);
-                        if take < data.len() {
-                            truncated = true;
-                        }
+                    }
+                    if stdout.len() >= MAX_OUTPUT_BYTES && !data.is_empty() {
+                        truncated = true;
                     }
                 }
                 ChannelMsg::ExtendedData { data, ext } => {
@@ -520,9 +520,9 @@ async fn handle_execute(
                         if remaining > 0 {
                             let take = data.len().min(remaining);
                             stderr.extend_from_slice(&data[..take]);
-                            if take < data.len() {
-                                truncated = true;
-                            }
+                        }
+                        if stderr.len() >= MAX_OUTPUT_BYTES && !data.is_empty() {
+                            truncated = true;
                         }
                     }
                 }
