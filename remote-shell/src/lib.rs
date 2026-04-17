@@ -253,7 +253,7 @@ fn format_connect_response(raw: &str) -> Result<String, String> {
         "Connected successfully.\n\
          Session ID: {}\n\
          {}\n\n\
-         Use this session_id for execute, disconnect, and list_sessions calls.",
+         Use this session_id for 'execute' and 'disconnect' calls.",
         resp.session_id, resp.message
     ))
 }
@@ -742,7 +742,7 @@ mod tests {
         let result = format_connect_response(raw).expect("should format");
         assert!(result.contains("abc-123"));
         assert!(result.contains("Session ID:"));
-        assert!(result.contains("session_id"));
+        assert!(!result.contains("list_sessions"));
     }
 
     #[test]
