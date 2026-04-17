@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 const MAX_TEXT_LENGTH: usize = 65536;
 const DEFAULT_GATEWAY_PORT: u16 = 9022;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const HTTP_TIMEOUT_MS: u32 = 60000;
+const HTTP_TIMEOUT_MS: u32 = 60_000;
+const HTTP_EXECUTE_TIMEOUT_BUFFER_SECS: u64 = 30;
 
 fn validate_input_length(s: &str, field_name: &str) -> Result<(), String> {
     if s.len() > MAX_TEXT_LENGTH {
@@ -158,6 +159,7 @@ fn gateway_request(
     path: &str,
     body: Option<String>,
     gateway_port: Option<u16>,
+    http_timeout_ms: u32,
 ) -> Result<String, String> {
     let base = gateway_url(gateway_port);
     let url = format!("{}{}", base, path);
@@ -174,7 +176,7 @@ fn gateway_request(
         &url,
         &headers.to_string(),
         body_bytes.as_deref(),
-        Some(HTTP_TIMEOUT_MS),
+        Some(http_timeout_ms),
     )
     .map_err(|e| format!("Gateway request failed: {e}"))?;
 
@@ -184,10 +186,11 @@ fn gateway_request(
     if response.status >= 200 && response.status < 300 {
         Ok(body_str)
     } else {
-        Err(format!(
-            "Gateway error (HTTP {}): {}",
-            response.status, body_str
-        ))
+        let msg = serde_json::from_str::<serde_json::Value>(&body_str)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or(body_str);
+        Err(format!("Gateway error (HTTP {}): {}", response.status, msg))
     }
 }
 
@@ -210,12 +213,87 @@ impl exports::near::agent::tool::Guest for RemoteShellTool {
     }
 
     fn description() -> String {
-        "Connect to remote machines via SSH and execute commands. \
-         Manages persistent SSH sessions through a local gateway service. \
-         Supports password and private key authentication. \
-         Start the gateway first: remote-shell-gateway"
+        "SSH remote shell: connect to servers and run commands. \
+         Actions: \
+         'connect' — open an SSH session to a host (returns a session_id); \
+         'execute' — run a shell command on an open session (returns stdout, stderr, exit code); \
+         'disconnect' — close an SSH session; \
+         'list_sessions' — list all currently open sessions. \
+         The remote-shell-gateway service must be running locally before use."
             .to_string()
     }
+}
+
+#[derive(Deserialize)]
+struct ConnectGatewayResponse {
+    session_id: String,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct ExecuteGatewayResponse {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct SessionInfoItem {
+    session_id: String,
+    host: String,
+    port: u16,
+    username: String,
+    age_secs: u64,
+}
+
+fn format_connect_response(raw: &str) -> Result<String, String> {
+    let resp: ConnectGatewayResponse =
+        serde_json::from_str(raw).map_err(|e| format!("Failed to parse gateway response: {e}"))?;
+    Ok(format!(
+        "Connected successfully.\n\
+         Session ID: {}\n\
+         {}\n\n\
+         Use this session_id for execute, disconnect, and list_sessions calls.",
+        resp.session_id, resp.message
+    ))
+}
+
+fn format_execute_response(raw: &str) -> Result<String, String> {
+    let resp: ExecuteGatewayResponse =
+        serde_json::from_str(raw).map_err(|e| format!("Failed to parse gateway response: {e}"))?;
+    let exit_str = resp
+        .exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "unknown (command may have timed out)".to_string());
+    let stdout_section = if resp.stdout.is_empty() {
+        "(empty)".to_string()
+    } else {
+        resp.stdout
+    };
+    let stderr_section = if resp.stderr.is_empty() {
+        "(empty)".to_string()
+    } else {
+        resp.stderr
+    };
+    Ok(format!(
+        "Exit code: {exit_str}\n\n--- stdout ---\n{stdout_section}\n--- stderr ---\n{stderr_section}"
+    ))
+}
+
+fn format_sessions_response(raw: &str) -> Result<String, String> {
+    let sessions: Vec<SessionInfoItem> =
+        serde_json::from_str(raw).map_err(|e| format!("Failed to parse gateway response: {e}"))?;
+    if sessions.is_empty() {
+        return Ok("No active sessions.".to_string());
+    }
+    let mut out = format!("Active sessions ({}):\n", sessions.len());
+    for s in &sessions {
+        out.push_str(&format!(
+            "\n  Session ID : {}\n  Host       : {}:{}\n  Username   : {}\n  Age        : {} seconds\n",
+            s.session_id, s.host, s.port, s.username, s.age_secs
+        ));
+    }
+    Ok(out)
 }
 
 fn execute_inner(params: &str) -> Result<String, String> {
@@ -234,7 +312,9 @@ fn execute_inner(params: &str) -> Result<String, String> {
             gateway_port,
         } => {
             validate_hostname(&host)?;
-            validate_input_length(&username, "username")?;
+            if username.is_empty() || username.len() > MAX_TEXT_LENGTH {
+                return Err(format!("username must be 1-{MAX_TEXT_LENGTH} characters"));
+            }
 
             let gw_req = GatewayConnectRequest {
                 session_id,
@@ -247,7 +327,14 @@ fn execute_inner(params: &str) -> Result<String, String> {
             };
             let body = serde_json::to_string(&gw_req)
                 .map_err(|e| format!("Failed to serialize request: {e}"))?;
-            gateway_request("POST", "/connect", Some(body), gateway_port)
+            let raw = gateway_request(
+                "POST",
+                "/connect",
+                Some(body),
+                gateway_port,
+                HTTP_TIMEOUT_MS,
+            )?;
+            format_connect_response(&raw)
         }
 
         RemoteShellAction::Execute {
@@ -256,33 +343,58 @@ fn execute_inner(params: &str) -> Result<String, String> {
             timeout_secs,
             gateway_port,
         } => {
-            validate_input_length(&session_id, "session_id")?;
+            if session_id.is_empty() || session_id.len() > MAX_TEXT_LENGTH {
+                return Err(format!("session_id must be 1-{MAX_TEXT_LENGTH} characters"));
+            }
             validate_command(&command)?;
+
+            let timeout_secs = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+            let http_timeout_ms = ((timeout_secs + HTTP_EXECUTE_TIMEOUT_BUFFER_SECS) * 1000)
+                .min(u64::from(u32::MAX)) as u32;
 
             let gw_req = GatewayExecuteRequest {
                 session_id,
                 command,
-                timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+                timeout_secs,
             };
             let body = serde_json::to_string(&gw_req)
                 .map_err(|e| format!("Failed to serialize request: {e}"))?;
-            gateway_request("POST", "/execute", Some(body), gateway_port)
+            let raw = gateway_request(
+                "POST",
+                "/execute",
+                Some(body),
+                gateway_port,
+                http_timeout_ms,
+            )?;
+            format_execute_response(&raw)
         }
 
         RemoteShellAction::Disconnect {
             session_id,
             gateway_port,
         } => {
-            validate_input_length(&session_id, "session_id")?;
-
+            if session_id.is_empty() || session_id.len() > MAX_TEXT_LENGTH {
+                return Err(format!("session_id must be 1-{MAX_TEXT_LENGTH} characters"));
+            }
+            let session_id_display = session_id.clone();
             let gw_req = GatewayDisconnectRequest { session_id };
             let body = serde_json::to_string(&gw_req)
                 .map_err(|e| format!("Failed to serialize request: {e}"))?;
-            gateway_request("DELETE", "/disconnect", Some(body), gateway_port)
+            gateway_request(
+                "DELETE",
+                "/disconnect",
+                Some(body),
+                gateway_port,
+                HTTP_TIMEOUT_MS,
+            )?;
+            Ok(format!(
+                "Session '{session_id_display}' disconnected successfully."
+            ))
         }
 
         RemoteShellAction::ListSessions { gateway_port } => {
-            gateway_request("GET", "/sessions", None, gateway_port)
+            let raw = gateway_request("GET", "/sessions", None, gateway_port, HTTP_TIMEOUT_MS)?;
+            format_sessions_response(&raw)
         }
     }
 }
@@ -305,23 +417,25 @@ const SCHEMA: &str = r#"{
                                 "type": { "const": "password" },
                                 "password": { "type": "string", "description": "SSH password" }
                             },
-                            "required": ["type", "password"]
+                            "required": ["type", "password"],
+                            "description": "Password auth — example: {\"type\": \"password\", \"password\": \"mypass\"}"
                         },
                         {
                             "type": "object",
                             "properties": {
                                 "type": { "const": "private_key" },
-                                "key_pem": { "type": "string", "description": "PEM-encoded private key" },
-                                "passphrase": { "type": "string", "description": "Key passphrase (if encrypted)" }
+                                "key_pem": { "type": "string", "description": "PEM-encoded private key content (full -----BEGIN ... END----- block)" },
+                                "passphrase": { "type": "string", "description": "Key passphrase (omit if key is not encrypted)" }
                             },
-                            "required": ["type", "key_pem"]
+                            "required": ["type", "key_pem"],
+                            "description": "Private key auth — example: {\"type\": \"private_key\", \"key_pem\": \"-----BEGIN OPENSSH PRIVATE KEY-----\\n...\\n-----END OPENSSH PRIVATE KEY-----\"}"
                         }
                     ],
-                    "description": "Authentication method"
+                    "description": "Authentication credentials. Choose 'password' for password auth or 'private_key' for key-based auth."
                 },
-                "session_id": { "type": "string", "description": "Optional session identifier (auto-generated if omitted)" },
-                "host_key_fingerprint": { "type": "string", "description": "SSH host key fingerprint for verification (e.g. SHA256:...). Obtain with: ssh-keyscan <host> | ssh-keygen -lf -" },
-                "insecure_ignore_host_key": { "type": "boolean", "description": "Skip host key verification (INSECURE, vulnerable to MITM). Only use for trusted networks.", "default": false },
+                "session_id": { "type": "string", "description": "Optional name for this session (auto-generated UUID if omitted). Use a memorable name like 'prod' or 'staging' for easy reference." },
+                "host_key_fingerprint": { "type": "string", "description": "SHA256 fingerprint of the server's host key for MITM protection. Obtain with: ssh-keyscan <host> | ssh-keygen -lf -. Either this or insecure_ignore_host_key must be provided." },
+                "insecure_ignore_host_key": { "type": "boolean", "description": "Set true to skip host key verification. INSECURE — vulnerable to MITM attacks. Only use on fully trusted private networks when you cannot get the fingerprint.", "default": false },
                 "gateway_port": { "type": "integer", "description": "SSH gateway port (default: 9022)" }
             },
             "required": ["action", "host", "username", "auth"]
@@ -619,5 +733,69 @@ mod tests {
         let json = r#"{"action": "nonexistent"}"#;
         let result: Result<RemoteShellAction, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_connect_response() {
+        let raw =
+            r#"{"session_id":"abc-123","message":"Connected to server.example.com:22 as deploy"}"#;
+        let result = format_connect_response(raw).expect("should format");
+        assert!(result.contains("abc-123"));
+        assert!(result.contains("Session ID:"));
+        assert!(result.contains("session_id"));
+    }
+
+    #[test]
+    fn test_format_execute_response_with_output() {
+        let raw = r#"{"stdout":"hello world\n","stderr":"","exit_code":0}"#;
+        let result = format_execute_response(raw).expect("should format");
+        assert!(result.contains("Exit code: 0"));
+        assert!(result.contains("hello world"));
+        assert!(result.contains("--- stdout ---"));
+        assert!(result.contains("--- stderr ---"));
+        assert!(result.contains("(empty)"));
+    }
+
+    #[test]
+    fn test_format_execute_response_no_exit_code() {
+        let raw = r#"{"stdout":"","stderr":"timeout\n","exit_code":null}"#;
+        let result = format_execute_response(raw).expect("should format");
+        assert!(result.contains("unknown (command may have timed out)"));
+        assert!(result.contains("timeout"));
+    }
+
+    #[test]
+    fn test_format_sessions_response_empty() {
+        let result = format_sessions_response("[]").expect("should format");
+        assert_eq!(result, "No active sessions.");
+    }
+
+    #[test]
+    fn test_format_sessions_response_with_sessions() {
+        let raw = r#"[{"session_id":"prod","host":"server.example.com","port":22,"username":"deploy","age_secs":120}]"#;
+        let result = format_sessions_response(raw).expect("should format");
+        assert!(result.contains("Active sessions (1)"));
+        assert!(result.contains("prod"));
+        assert!(result.contains("server.example.com:22"));
+        assert!(result.contains("120 seconds"));
+    }
+
+    #[test]
+    fn test_http_execute_timeout_scales_with_command_timeout() {
+        let timeout_secs: u64 = 120;
+        let http_timeout_ms = ((timeout_secs + HTTP_EXECUTE_TIMEOUT_BUFFER_SECS) * 1000)
+            .min(u64::from(u32::MAX)) as u32;
+        assert_eq!(http_timeout_ms, 150_000);
+        assert!(http_timeout_ms > HTTP_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn test_description_lists_all_actions() {
+        use crate::exports::near::agent::tool::Guest;
+        let desc = RemoteShellTool::description();
+        assert!(desc.contains("connect"));
+        assert!(desc.contains("execute"));
+        assert!(desc.contains("disconnect"));
+        assert!(desc.contains("list_sessions"));
     }
 }
