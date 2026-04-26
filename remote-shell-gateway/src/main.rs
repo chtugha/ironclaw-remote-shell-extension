@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use axum::extract::{Json, State};
+use anyhow::{anyhow, Result};
+use axum::extract::{DefaultBodyLimit, Json, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::IntoResponse;
@@ -16,6 +16,7 @@ use russh::client;
 use russh::ChannelMsg;
 use russh_keys::key::PrivateKeyWithHashAlg;
 use serde::{Deserialize, Serialize};
+use ssh_key::HashAlg;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -30,6 +31,9 @@ const MIN_TIMEOUT_SECS: u64 = 1;
 const MAX_TIMEOUT_SECS: u64 = 3600;
 const MAX_INPUT_LENGTH: usize = 65536;
 const MAX_HOSTNAME_LENGTH: usize = 253;
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_CONNECT_BODY_BYTES: usize = 512 * 1024;
+const MAX_LOGGED_COMMAND_LEN: usize = 64;
 
 #[derive(Parser)]
 #[command(
@@ -107,7 +111,6 @@ struct ConnectRequest {
     host: String,
     port: Option<u16>,
     username: String,
-    #[serde(default)]
     auth: AuthMethod,
     host_key_fingerprint: Option<String>,
     #[serde(default)]
@@ -124,14 +127,6 @@ enum AuthMethod {
         key_pem: String,
         passphrase: Option<String>,
     },
-}
-
-impl Default for AuthMethod {
-    fn default() -> Self {
-        AuthMethod::Password {
-            password: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +210,65 @@ async fn auth_middleware(
         }
     }
     next.run(request).await.into_response()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    host.eq_ignore_ascii_case("localhost")
+}
+
+fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…[+{} bytes]", &s[..end], s.len() - end)
+    }
+}
+
+async fn authenticate_with_hash_fallback(
+    handle: &mut client::Handle<SshHandler>,
+    username: &str,
+    key_pair: Arc<russh_keys::PrivateKey>,
+) -> Result<bool, anyhow::Error> {
+    let candidates: &[Option<HashAlg>] = if key_pair.algorithm().is_rsa() {
+        &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
+    } else {
+        &[None]
+    };
+    let mut last_err: Option<anyhow::Error> = None;
+    for &hash_alg in candidates {
+        let key_with_hash = match PrivateKeyWithHashAlg::new(Arc::clone(&key_pair), hash_alg) {
+            Ok(k) => k,
+            Err(e) => {
+                debug!(?hash_alg, error = %e, "key incompatible with hash algorithm, trying next");
+                last_err = Some(anyhow!("Failed to prepare private key: {e}"));
+                continue;
+            }
+        };
+        match handle.authenticate_publickey(username, key_with_hash).await {
+            Ok(true) => return Ok(true),
+            Ok(false) => {
+                debug!(?hash_alg, "auth rejected with this hash algorithm, trying next");
+                last_err = None;
+                continue;
+            }
+            Err(e) => {
+                debug!(?hash_alg, error = %e, "auth errored with this hash algorithm, trying next");
+                last_err = Some(anyhow!("{e}"));
+                continue;
+            }
+        }
+    }
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(false),
+    }
 }
 
 async fn reap_expired_sessions(state: &AppState) {
@@ -329,10 +383,11 @@ async fn handle_connect(
         }
     };
 
-    let auth_result = match &req.auth {
-        AuthMethod::Password { password } => {
-            handle.authenticate_password(&req.username, password).await
-        }
+    let auth_result: Result<bool, anyhow::Error> = match &req.auth {
+        AuthMethod::Password { password } => handle
+            .authenticate_password(&req.username, password)
+            .await
+            .map_err(anyhow::Error::from),
         AuthMethod::PrivateKey {
             key_pem,
             passphrase,
@@ -347,19 +402,8 @@ async fn handle_connect(
                     );
                 }
             };
-            let key_with_hash = match PrivateKeyWithHashAlg::new(Arc::new(key_pair), None) {
-                Ok(k) => k,
-                Err(e) => {
-                    error!(error = %e, "failed to prepare private key");
-                    return error_json(
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to prepare private key: {e}"),
-                    );
-                }
-            };
-            handle
-                .authenticate_publickey(&req.username, key_with_hash)
-                .await
+            let key_pair = Arc::new(key_pair);
+            authenticate_with_hash_fallback(&mut handle, &req.username, key_pair).await
         }
     };
 
@@ -436,6 +480,8 @@ async fn handle_execute(
     State(state): State<AppState>,
     Json(req): Json<ExecuteRequest>,
 ) -> impl IntoResponse {
+    reap_expired_sessions(&state).await;
+
     if req.session_id.is_empty() || req.session_id.len() > MAX_INPUT_LENGTH {
         return error_json(StatusCode::BAD_REQUEST, "Invalid session_id length".into());
     }
@@ -455,18 +501,7 @@ async fn handle_execute(
     let session = {
         let sessions = state.sessions.read().await;
         match sessions.get(&req.session_id) {
-            Some(s) => {
-                if s.created_at.elapsed() >= state.session_ttl {
-                    drop(sessions);
-                    let mut sessions = state.sessions.write().await;
-                    sessions.remove(&req.session_id);
-                    return error_json(
-                        StatusCode::GONE,
-                        format!("Session '{}' has expired", req.session_id),
-                    );
-                }
-                Arc::clone(s)
-            }
+            Some(s) => Arc::clone(s),
             None => {
                 return error_json(
                     StatusCode::NOT_FOUND,
@@ -487,12 +522,17 @@ async fn handle_execute(
         }
     };
 
-    if let Err(e) = channel.exec(true, req.command.as_bytes()).await {
+    if let Err(e) = channel.exec(false, req.command.as_bytes()).await {
         error!(error = %e, "failed to execute command");
+        let _ = channel.close().await;
         return error_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to execute command: {e}"),
         );
+    }
+
+    if let Err(e) = channel.eof().await {
+        debug!(error = %e, "failed to send EOF on stdin (continuing anyway)");
     }
 
     let mut stdout = Vec::new();
@@ -541,6 +581,7 @@ async fn handle_execute(
 
     if timed_out {
         stderr.extend_from_slice(b"\n[timeout: command exceeded time limit]");
+        let _ = channel.close().await;
     }
     if truncated {
         stderr.extend_from_slice(b"\n[warning: output truncated at 10MB limit]");
@@ -551,7 +592,8 @@ async fn handle_execute(
 
     debug!(
         session_id = %req.session_id,
-        command = %req.command,
+        command_preview = %truncate_for_log(&req.command, MAX_LOGGED_COMMAND_LEN),
+        command_len = req.command.len(),
         exit_code = ?exit_code,
         "command executed"
     );
@@ -573,6 +615,7 @@ async fn handle_disconnect(
     State(state): State<AppState>,
     Json(req): Json<DisconnectRequest>,
 ) -> impl IntoResponse {
+    reap_expired_sessions(&state).await;
     if req.session_id.is_empty() || req.session_id.len() > MAX_INPUT_LENGTH {
         return error_json(StatusCode::BAD_REQUEST, "Invalid session_id length".into());
     }
@@ -605,6 +648,7 @@ async fn handle_disconnect(
 }
 
 async fn handle_list_sessions(State(state): State<AppState>) -> impl IntoResponse {
+    reap_expired_sessions(&state).await;
     let sessions = state.sessions.read().await;
     let list: Vec<SessionInfo> = sessions
         .iter()
@@ -644,6 +688,21 @@ async fn main() -> Result<()> {
         warn!("no SSH_GATEWAY_TOKEN set — gateway is unauthenticated, only bind to localhost");
     }
 
+    if !is_loopback_host(&cli.host) && bearer_token.is_none() {
+        return Err(anyhow!(
+            "Refusing to bind to non-loopback address '{}' without SSH_GATEWAY_TOKEN. \
+             Set SSH_GATEWAY_TOKEN to a strong secret before exposing the gateway off-host.",
+            cli.host
+        ));
+    }
+
+    if cli.max_sessions == 0 {
+        return Err(anyhow!("--max-sessions must be at least 1"));
+    }
+    if cli.session_ttl_secs == 0 {
+        return Err(anyhow!("--session-ttl-secs must be at least 1"));
+    }
+
     let state = AppState {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         bearer_token,
@@ -653,9 +712,13 @@ async fn main() -> Result<()> {
 
     let protected = Router::new()
         .route("/sessions", get(handle_list_sessions))
-        .route("/connect", post(handle_connect))
+        .route(
+            "/connect",
+            post(handle_connect).layer(DefaultBodyLimit::max(MAX_CONNECT_BODY_BYTES)),
+        )
         .route("/execute", post(handle_execute))
         .route("/disconnect", delete(handle_disconnect))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -680,12 +743,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_auth_method() {
-        let auth = AuthMethod::default();
-        match auth {
-            AuthMethod::Password { password } => assert!(password.is_empty()),
-            _ => panic!("default should be Password"),
-        }
+    fn test_connect_request_requires_auth() {
+        let json = r#"{
+            "host": "example.com",
+            "username": "deploy"
+        }"#;
+        let result: Result<ConnectRequest, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "auth must be required: serde should reject the request"
+        );
+    }
+
+    #[test]
+    fn test_is_loopback_host() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("Localhost"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.1"));
+        assert!(!is_loopback_host("example.com"));
+    }
+
+    #[test]
+    fn test_truncate_for_log() {
+        assert_eq!(truncate_for_log("short", 10), "short");
+        let long = "abcdefghijklmnop";
+        let out = truncate_for_log(long, 5);
+        assert!(out.starts_with("abcde"));
+        assert!(out.contains("+11 bytes"));
     }
 
     #[test]
@@ -776,7 +864,8 @@ mod tests {
     fn test_connect_request_defaults() {
         let json = r#"{
             "host": "example.com",
-            "username": "user"
+            "username": "user",
+            "auth": { "type": "password", "password": "x" }
         }"#;
         let req: ConnectRequest = serde_json::from_str(json).expect("should deserialize");
         assert!(!req.insecure_ignore_host_key);

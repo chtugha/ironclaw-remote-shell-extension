@@ -6,39 +6,73 @@ wit_bindgen::generate!({
 use serde::{Deserialize, Serialize};
 
 const MAX_TEXT_LENGTH: usize = 65536;
+const MAX_HOSTNAME_LENGTH: usize = 253;
+const MAX_KEY_PEM_LENGTH: usize = 256 * 1024;
 const DEFAULT_GATEWAY_PORT: u16 = 9022;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const MIN_TIMEOUT_SECS: u64 = 1;
+const MAX_TIMEOUT_SECS: u64 = 3600;
 const HTTP_TIMEOUT_MS: u32 = 60_000;
 const HTTP_EXECUTE_TIMEOUT_BUFFER_SECS: u64 = 30;
 
-fn validate_input_length(s: &str, field_name: &str) -> Result<(), String> {
-    if s.len() > MAX_TEXT_LENGTH {
+fn validate_input_length(s: &str, field_name: &str, max_len: usize) -> Result<(), String> {
+    if s.len() > max_len {
         return Err(format!(
             "Input '{}' exceeds maximum length of {} characters",
-            field_name, MAX_TEXT_LENGTH
+            field_name, max_len
         ));
     }
     Ok(())
+}
+
+fn validate_non_empty(s: &str, field_name: &str, max_len: usize) -> Result<(), String> {
+    if s.is_empty() {
+        return Err(format!("'{}' cannot be empty", field_name));
+    }
+    validate_input_length(s, field_name, max_len)
 }
 
 fn validate_hostname(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("Hostname cannot be empty".into());
     }
-    if host.len() > 253 {
-        return Err("Hostname too long (max 253 characters)".into());
+    if host.trim().is_empty() {
+        return Err("Hostname cannot be whitespace only".into());
     }
-    if host.contains(' ') || host.contains('\n') || host.contains('\r') {
+    if host.len() > MAX_HOSTNAME_LENGTH {
+        return Err(format!(
+            "Hostname too long (max {} characters)",
+            MAX_HOSTNAME_LENGTH
+        ));
+    }
+    if host
+        .chars()
+        .any(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\0')
+    {
         return Err("Hostname contains invalid characters".into());
     }
     Ok(())
 }
 
 fn validate_command(command: &str) -> Result<(), String> {
-    if command.is_empty() {
-        return Err("Command cannot be empty".into());
+    validate_non_empty(command, "command", MAX_TEXT_LENGTH)
+}
+
+fn compute_http_execute_timeout_ms(timeout_secs: u64) -> u32 {
+    timeout_secs
+        .saturating_add(HTTP_EXECUTE_TIMEOUT_BUFFER_SECS)
+        .saturating_mul(1000)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+fn validate_timeout_secs(t: u64) -> Result<u64, String> {
+    if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&t) {
+        return Err(format!(
+            "timeout_secs must be {}-{} (got {})",
+            MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS, t
+        ));
     }
-    validate_input_length(command, "command")
+    Ok(t)
 }
 
 struct RemoteShellTool;
@@ -51,7 +85,6 @@ enum RemoteShellAction {
         host: String,
         port: Option<u16>,
         username: String,
-        #[serde(default)]
         auth: AuthMethod,
         session_id: Option<String>,
         host_key_fingerprint: Option<String>,
@@ -76,6 +109,9 @@ enum RemoteShellAction {
 
     #[serde(rename = "list_sessions")]
     ListSessions { gateway_port: Option<u16> },
+
+    #[serde(rename = "health")]
+    Health { gateway_port: Option<u16> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,14 +124,6 @@ enum AuthMethod {
         key_pem: String,
         passphrase: Option<String>,
     },
-}
-
-impl Default for AuthMethod {
-    fn default() -> Self {
-        AuthMethod::Password {
-            password: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -218,8 +246,9 @@ impl exports::near::agent::tool::Guest for RemoteShellTool {
          'connect' — open an SSH session to a host (returns a session_id); \
          'execute' — run a shell command on an open session (returns stdout, stderr, exit code); \
          'disconnect' — close an SSH session; \
-         'list_sessions' — list all currently open sessions. \
-         The remote-shell-gateway service must be running locally before use."
+         'list_sessions' — list all currently open sessions; \
+         'health' — verify the local gateway service is reachable. \
+         The remote-shell-gateway service must be running locally before use; call 'health' first if unsure."
             .to_string()
     }
 }
@@ -265,19 +294,19 @@ fn format_execute_response(raw: &str) -> Result<String, String> {
         .exit_code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "unknown (command may have timed out)".to_string());
-    let stdout_section = if resp.stdout.is_empty() {
-        "(empty)".to_string()
-    } else {
-        resp.stdout
-    };
-    let stderr_section = if resp.stderr.is_empty() {
-        "(empty)".to_string()
-    } else {
-        resp.stderr
-    };
-    Ok(format!(
-        "Exit code: {exit_str}\n\n--- stdout ---\n{stdout_section}\n--- stderr ---\n{stderr_section}"
-    ))
+    if resp.stdout.is_empty() && resp.stderr.is_empty() {
+        return Ok(format!("Exit code: {exit_str}\n(no output)"));
+    }
+    let mut out = format!("Exit code: {exit_str}\n");
+    if !resp.stdout.is_empty() {
+        out.push_str("\n--- stdout ---\n");
+        out.push_str(&resp.stdout);
+    }
+    if !resp.stderr.is_empty() {
+        out.push_str("\n--- stderr ---\n");
+        out.push_str(&resp.stderr);
+    }
+    Ok(out)
 }
 
 fn format_sessions_response(raw: &str) -> Result<String, String> {
@@ -312,8 +341,33 @@ fn execute_inner(params: &str) -> Result<String, String> {
             gateway_port,
         } => {
             validate_hostname(&host)?;
-            if username.is_empty() || username.len() > MAX_TEXT_LENGTH {
-                return Err(format!("username must be 1-{MAX_TEXT_LENGTH} characters"));
+            validate_non_empty(&username, "username", MAX_TEXT_LENGTH)?;
+            if let Some(ref sid) = session_id {
+                validate_non_empty(sid, "session_id", MAX_TEXT_LENGTH)?;
+            }
+            match &auth {
+                AuthMethod::Password { password } => {
+                    validate_input_length(password, "auth.password", MAX_TEXT_LENGTH)?;
+                }
+                AuthMethod::PrivateKey {
+                    key_pem,
+                    passphrase,
+                } => {
+                    validate_non_empty(key_pem, "auth.key_pem", MAX_KEY_PEM_LENGTH)?;
+                    if let Some(p) = passphrase {
+                        validate_input_length(p, "auth.passphrase", MAX_TEXT_LENGTH)?;
+                    }
+                }
+            }
+            if !insecure_ignore_host_key && host_key_fingerprint.is_none() {
+                return Err(
+                    "Either 'host_key_fingerprint' (recommended) or 'insecure_ignore_host_key': true must be provided. \
+                     Get the fingerprint with: ssh-keyscan <host> | ssh-keygen -lf -"
+                        .to_string(),
+                );
+            }
+            if let Some(ref fp) = host_key_fingerprint {
+                validate_non_empty(fp, "host_key_fingerprint", MAX_TEXT_LENGTH)?;
             }
 
             let gw_req = GatewayConnectRequest {
@@ -343,14 +397,11 @@ fn execute_inner(params: &str) -> Result<String, String> {
             timeout_secs,
             gateway_port,
         } => {
-            if session_id.is_empty() || session_id.len() > MAX_TEXT_LENGTH {
-                return Err(format!("session_id must be 1-{MAX_TEXT_LENGTH} characters"));
-            }
+            validate_non_empty(&session_id, "session_id", MAX_TEXT_LENGTH)?;
             validate_command(&command)?;
 
-            let timeout_secs = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
-            let http_timeout_ms = ((timeout_secs + HTTP_EXECUTE_TIMEOUT_BUFFER_SECS) * 1000)
-                .min(u64::from(u32::MAX)) as u32;
+            let timeout_secs = validate_timeout_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS))?;
+            let http_timeout_ms = compute_http_execute_timeout_ms(timeout_secs);
 
             let gw_req = GatewayExecuteRequest {
                 session_id,
@@ -373,9 +424,7 @@ fn execute_inner(params: &str) -> Result<String, String> {
             session_id,
             gateway_port,
         } => {
-            if session_id.is_empty() || session_id.len() > MAX_TEXT_LENGTH {
-                return Err(format!("session_id must be 1-{MAX_TEXT_LENGTH} characters"));
-            }
+            validate_non_empty(&session_id, "session_id", MAX_TEXT_LENGTH)?;
             let session_id_display = session_id.clone();
             let gw_req = GatewayDisconnectRequest { session_id };
             let body = serde_json::to_string(&gw_req)
@@ -395,6 +444,19 @@ fn execute_inner(params: &str) -> Result<String, String> {
         RemoteShellAction::ListSessions { gateway_port } => {
             let raw = gateway_request("GET", "/sessions", None, gateway_port, HTTP_TIMEOUT_MS)?;
             format_sessions_response(&raw)
+        }
+
+        RemoteShellAction::Health { gateway_port } => {
+            match gateway_request("GET", "/health", None, gateway_port, HTTP_TIMEOUT_MS) {
+                Ok(_) => Ok(format!(
+                    "Gateway is reachable at {}.",
+                    gateway_url(gateway_port)
+                )),
+                Err(e) => Err(format!(
+                    "Gateway is NOT reachable at {}. Start it with `remote-shell-gateway` (see README). Detail: {e}",
+                    gateway_url(gateway_port)
+                )),
+            }
         }
     }
 }
@@ -445,7 +507,7 @@ const SCHEMA: &str = r#"{
                 "action": { "const": "execute" },
                 "session_id": { "type": "string", "description": "Session ID from a previous connect call" },
                 "command": { "type": "string", "description": "Shell command to execute on the remote machine" },
-                "timeout_secs": { "type": "integer", "description": "Command timeout in seconds (default: 30)", "default": 30 },
+                "timeout_secs": { "type": "integer", "description": "Command timeout in seconds (1-3600, default: 30)", "default": 30, "minimum": 1, "maximum": 3600 },
                 "gateway_port": { "type": "integer", "description": "SSH gateway port (default: 9022)" }
             },
             "required": ["action", "session_id", "command"]
@@ -461,6 +523,13 @@ const SCHEMA: &str = r#"{
         {
             "properties": {
                 "action": { "const": "list_sessions" },
+                "gateway_port": { "type": "integer", "description": "SSH gateway port (default: 9022)" }
+            },
+            "required": ["action"]
+        },
+        {
+            "properties": {
+                "action": { "const": "health" },
                 "gateway_port": { "type": "integer", "description": "SSH gateway port (default: 9022)" }
             },
             "required": ["action"]
@@ -503,7 +572,8 @@ mod tests {
         assert!(actions.contains("execute"));
         assert!(actions.contains("disconnect"));
         assert!(actions.contains("list_sessions"));
-        assert_eq!(actions.len(), 4);
+        assert!(actions.contains("health"));
+        assert_eq!(actions.len(), 5);
     }
 
     #[test]
@@ -512,9 +582,12 @@ mod tests {
         assert!(validate_hostname("192.168.1.1").is_ok());
         assert!(validate_hostname("my-server.internal").is_ok());
         assert!(validate_hostname("").is_err());
+        assert!(validate_hostname("   ").is_err());
         assert!(validate_hostname("host name").is_err());
+        assert!(validate_hostname("host\tname").is_err());
         assert!(validate_hostname("host\nname").is_err());
-        let long = "a".repeat(254);
+        assert!(validate_hostname("host\0name").is_err());
+        let long = "a".repeat(MAX_HOSTNAME_LENGTH + 1);
         assert!(validate_hostname(&long).is_err());
     }
 
@@ -529,9 +602,76 @@ mod tests {
 
     #[test]
     fn test_validate_input_length() {
-        assert!(validate_input_length("short", "test").is_ok());
+        assert!(validate_input_length("short", "test", MAX_TEXT_LENGTH).is_ok());
         let long = "a".repeat(MAX_TEXT_LENGTH + 1);
-        assert!(validate_input_length(&long, "test").is_err());
+        assert!(validate_input_length(&long, "test", MAX_TEXT_LENGTH).is_err());
+    }
+
+    #[test]
+    fn test_validate_timeout_secs() {
+        assert!(validate_timeout_secs(1).is_ok());
+        assert!(validate_timeout_secs(30).is_ok());
+        assert!(validate_timeout_secs(3600).is_ok());
+        assert!(validate_timeout_secs(0).is_err());
+        assert!(validate_timeout_secs(3601).is_err());
+        assert!(validate_timeout_secs(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn test_connect_requires_host_key_or_insecure() {
+        let params = r#"{
+            "action": "connect",
+            "host": "example.com",
+            "username": "deploy",
+            "auth": { "type": "password", "password": "x" }
+        }"#;
+        let err = execute_inner(params).unwrap_err();
+        assert!(err.contains("host_key_fingerprint"));
+        assert!(err.contains("insecure_ignore_host_key"));
+    }
+
+    #[test]
+    fn test_connect_requires_auth() {
+        let params = r#"{
+            "action": "connect",
+            "host": "example.com",
+            "username": "deploy",
+            "insecure_ignore_host_key": true
+        }"#;
+        let err = execute_inner(params).unwrap_err();
+        assert!(err.to_lowercase().contains("invalid parameters"));
+    }
+
+    #[test]
+    fn test_execute_rejects_out_of_range_timeout() {
+        let params = r#"{
+            "action": "execute",
+            "session_id": "s",
+            "command": "ls",
+            "timeout_secs": 10000
+        }"#;
+        let err = execute_inner(params).unwrap_err();
+        assert!(err.contains("timeout_secs"));
+    }
+
+    #[test]
+    fn test_execute_rejects_zero_timeout() {
+        let params = r#"{
+            "action": "execute",
+            "session_id": "s",
+            "command": "ls",
+            "timeout_secs": 0
+        }"#;
+        assert!(execute_inner(params).is_err());
+    }
+
+    #[test]
+    fn test_format_execute_response_collapses_empty() {
+        let raw = r#"{"stdout":"","stderr":"","exit_code":0}"#;
+        let result = format_execute_response(raw).expect("should format");
+        assert!(result.contains("(no output)"));
+        assert!(!result.contains("--- stdout ---"));
+        assert!(!result.contains("--- stderr ---"));
     }
 
     #[test]
@@ -752,8 +892,8 @@ mod tests {
         assert!(result.contains("Exit code: 0"));
         assert!(result.contains("hello world"));
         assert!(result.contains("--- stdout ---"));
-        assert!(result.contains("--- stderr ---"));
-        assert!(result.contains("(empty)"));
+        assert!(!result.contains("--- stderr ---"));
+        assert!(!result.contains("(empty)"));
     }
 
     #[test]
@@ -782,11 +922,22 @@ mod tests {
 
     #[test]
     fn test_http_execute_timeout_scales_with_command_timeout() {
-        let timeout_secs: u64 = 120;
-        let http_timeout_ms = ((timeout_secs + HTTP_EXECUTE_TIMEOUT_BUFFER_SECS) * 1000)
-            .min(u64::from(u32::MAX)) as u32;
+        let http_timeout_ms = compute_http_execute_timeout_ms(120);
         assert_eq!(http_timeout_ms, 150_000);
         assert!(http_timeout_ms > HTTP_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn test_http_execute_timeout_saturates_on_overflow() {
+        let http_timeout_ms = compute_http_execute_timeout_ms(u64::MAX - 1);
+        assert_eq!(http_timeout_ms, u32::MAX);
+    }
+
+    #[test]
+    fn test_http_execute_timeout_saturates_at_max_timeout_secs() {
+        let http_timeout_ms = compute_http_execute_timeout_ms(MAX_TIMEOUT_SECS);
+        let expected = (MAX_TIMEOUT_SECS + HTTP_EXECUTE_TIMEOUT_BUFFER_SECS) * 1000;
+        assert_eq!(u64::from(http_timeout_ms), expected);
     }
 
     #[test]
@@ -797,5 +948,6 @@ mod tests {
         assert!(desc.contains("execute"));
         assert!(desc.contains("disconnect"));
         assert!(desc.contains("list_sessions"));
+        assert!(desc.contains("health"));
     }
 }

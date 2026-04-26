@@ -8,17 +8,23 @@
     ],
     "conditional_requirements": [
       "`connect` requires `host`, `username`, `auth`, and either `host_key_fingerprint` (SHA256:... for MITM protection, obtain with: ssh-keyscan <host> | ssh-keygen -lf -) or `insecure_ignore_host_key: true` (skips verification, only for trusted networks).",
-      "`execute` requires `session_id` and `command`.",
+      "`execute` requires `session_id` and `command`. `timeout_secs` (1-3600, default 30) is optional.",
       "`disconnect` requires `session_id`.",
-      "`list_sessions` has no additional requirements."
+      "`list_sessions` has no additional requirements.",
+      "`health` has no additional requirements; it probes the local gateway."
     ],
     "notes": [
-      "The SSH gateway service (`remote-shell-gateway`) must be running locally before using this tool.",
+      "The SSH gateway service (`remote-shell-gateway`) must be running locally before using this tool. Use the `health` action to verify reachability before any other operation if you suspect the gateway is down.",
       "Default gateway port is 9022. Override with the `gateway_port` parameter.",
-      "Sessions persist until explicitly disconnected or the gateway is restarted.",
+      "Sessions persist until explicitly disconnected, the gateway is restarted, or they exceed the gateway's TTL (default 3600s).",
+      "Reuse `session_id` across many `execute` calls — do NOT reconnect for every command.",
+      "Stdout / stderr are capped at 10 MB each; output beyond that is truncated.",
       "Use `tool_info(name: \"remote_shell\", detail: \"schema\")` for the full action schema."
     ],
     "examples": [
+      {
+        "action": "health"
+      },
       {
         "action": "connect",
         "host": "server.example.com",
