@@ -51,7 +51,7 @@ rustup target add wasm32-wasip2
 ### 4 — Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_ORG/ironclaw-remote-shell-extension.git
+git clone https://github.com/chtugha/ironclaw-remote-shell-extension
 cd ironclaw-remote-shell-extension
 ```
 
