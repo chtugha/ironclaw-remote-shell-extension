@@ -434,7 +434,7 @@ reconnecting with the same `session_id` is the recommended recovery.
 | `Authentication failed: credentials rejected` | Wrong username/password/key, or server requires keyboard-interactive. | Verify credentials manually with `ssh`. |
 | `host key fingerprint mismatch` | Server changed keys, or you are being MITM'd. | **Stop.** Verify the new fingerprint out-of-band before retrying. |
 | `Exit code: unknown (command may have timed out)` | Command exceeded `timeout_secs`. | Bump `timeout_secs` (max 3600), or run the work in the background. |
-| Gateway exits with `refusing to bind <host> without SSH_GATEWAY_TOKEN` | Non-loopback bind address requested without a token. | Either bind to `127.0.0.1`, or export `SSH_GATEWAY_TOKEN` first. |
+| Gateway exits: `Refusing to bind to non-loopback address '…' without SSH_GATEWAY_TOKEN` | Non-loopback bind address requested without a token. | Either bind to `127.0.0.1`, or export `SSH_GATEWAY_TOKEN` first. |
 
 ---
 
