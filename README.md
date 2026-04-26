@@ -80,14 +80,13 @@ The component is written to `target/wasm32-wasip2/release/remote_shell.wasm`.
 
 ### 8 — Install the IronClaw tool
 
-Copy the WASM component and capabilities file to IronClaw's tools directory:
 
 ```bash
-mkdir -p ~/.ironclaw/tools/remote-shell
-cp target/wasm32-wasip2/release/remote_shell.wasm \
-   ~/.ironclaw/tools/remote-shell/remote_shell.wasm
-cp remote-shell/remote-shell.capabilities.json \
-   ~/.ironclaw/tools/remote-shell/remote-shell.capabilities.json
+ironclaw tool install \
+  --name remote-shell \
+  target/wasm32-wasip2/release/remote_shell.wasm \
+  --capabilities remote-shell/remote-shell.capabilities.json \
+  --skip-build
 ```
 
 Restart IronClaw so it picks up the new tool.
