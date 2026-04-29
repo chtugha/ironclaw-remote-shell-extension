@@ -130,23 +130,21 @@ check the `"error"` key in the response body.
   proper file-transfer tool is available — but for small text files that
   pattern is acceptable.
 
-## Action lifecycle (memorise this order)
+## Action lifecycle (conceptual — execute via curl, not direct tool calls)
 
-> **Sandbox note**: all actions below fail with a sandbox HTTP restriction
-> error inside IronClaw. Use the `shell` tool + `curl` workaround from the
-> section above instead of calling `remote_shell` actions directly.
+**REQUIREMENT: Do not invoke remote_shell actions directly. All actions fail
+with a sandbox HTTP restriction inside IronClaw. Run the curl commands from
+the Sandbox section above via the shell tool.**
 
-1. **`health`** — call once at the start of a session if you don't already
-   know the gateway is up. On failure, ask the user to start
-   `remote-shell-gateway` (see project README) instead of retrying blindly.
-2. **`list_sessions`** — check whether a session you can reuse is already
-   open. Reusing a session avoids re-authentication and keeps the SSH
-   keepalive alive.
-3. **`connect`** — only when no usable session exists. Pick a memorable
-   `session_id` (`prod`, `staging`, `db-1`) so you can refer to it later.
-4. **`execute`** — call repeatedly on the same `session_id`. Default timeout
-   is 30 s (allowed range: 1–3600). Bump `timeout_secs` for long jobs.
-5. **`disconnect`** — when finished. The gateway will reap idle sessions
+1. **health** — curl once at session start to confirm the gateway is up. On
+   failure, ask the user to start `remote-shell-gateway` instead of retrying.
+2. **list sessions** — curl to check for a reusable open session.
+   Reusing avoids re-authentication and keeps the SSH keepalive alive.
+3. **connect** — curl only when no usable session exists. Pick a memorable
+   `session_id` (`prod`, `staging`, `db-1`) for later reference.
+4. **execute** — curl repeatedly on the same `session_id`. Default timeout
+   is 30 s (range: 1–3600). Bump `timeout_secs` for long-running jobs.
+5. **disconnect** — curl when finished. The gateway reaps idle sessions
    after the TTL anyway, but explicit disconnect is cleaner.
 
 ## Security rules (non-negotiable)
@@ -185,20 +183,25 @@ check the `"error"` key in the response body.
 - Don't blindly summarise large outputs into the user's chat — quote the
   relevant lines only.
 
-## Quick examples
+## Quick examples (shell tool + curl)
 
-Probe and reuse a session:
+Full session via the shell tool:
 
-```json
-{ "action": "health" }
-{ "action": "list_sessions" }
-{ "action": "connect", "host": "build.internal", "username": "ci",
-  "auth": { "type": "private_key", "key_pem": "-----BEGIN ...-----\n..." },
-  "host_key_fingerprint": "SHA256:abc…",
-  "session_id": "build" }
-{ "action": "execute", "session_id": "build",
-  "command": "git pull && make test", "timeout_secs": 300 }
-{ "action": "disconnect", "session_id": "build" }
+```bash
+curl -s 'http://127.0.0.1:9022/health'
+curl -s 'http://127.0.0.1:9022/sessions'
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"host":"build.internal","port":22,"username":"ci",
+       "auth":{"type":"password","password":"<PASSWORD>"},
+       "host_key_fingerprint":"SHA256:abc…","insecure_ignore_host_key":false,
+       "session_id":"build"}' \
+  'http://127.0.0.1:9022/connect'
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"session_id":"build","command":"git pull && make test","timeout_secs":300}' \
+  'http://127.0.0.1:9022/execute'
+curl -s -X DELETE -H 'Content-Type: application/json' \
+  -d '{"session_id":"build"}' \
+  'http://127.0.0.1:9022/disconnect'
 ```
 
 ## Don'ts

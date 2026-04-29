@@ -14,10 +14,9 @@
       "`health` has no additional requirements; it probes the local gateway."
     ],
     "notes": [
-      "The SSH gateway service (`remote-shell-gateway`) must be running locally before using this tool. Use the `health` action to verify reachability before any other operation if you suspect the gateway is down.",
-      "Default gateway port is 9022. Override with the `gateway_port` parameter.",
-      "Sessions persist until explicitly disconnected, the gateway is restarted, or they exceed the gateway's TTL (default 3600s).",
-      "Reuse `session_id` across many `execute` calls — do NOT reconnect for every command.",
+      "WARNING: The IronClaw WASM sandbox blocks all HTTP to 127.0.0.1 — every remote_shell action fails with a sandbox restriction error. Use the built-in shell tool with curl instead. See SKILL.md for ready-to-paste curl commands for every action.",
+      "The SSH gateway service (`remote-shell-gateway`) must be running locally. Default port is 9022; override with `gateway_port`.",
+      "Sessions persist until explicitly disconnected or the gateway TTL elapses (default 3600s). Reuse `session_id` across many commands — do NOT reconnect for every command.",
       "Stdout / stderr are capped at 10 MB each; output beyond that is truncated.",
       "Use `tool_info(name: \"remote_shell\", detail: \"schema\")` for the full action schema."
     ],
