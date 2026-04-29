@@ -43,6 +43,79 @@ SSH. The `remote_shell` tool talks to a local gateway service
 (`remote-shell-gateway`) which holds the actual SSH connections; the tool
 itself is sandboxed and only speaks HTTP to `127.0.0.1`.
 
+## Sandbox HTTP restriction (read this first)
+
+IronClaw's WASM sandbox **blocks all HTTP requests to `127.0.0.1`** (both
+scheme and loopback-IP layers). The `remote_shell` tool talks to the local
+gateway over `http://127.0.0.1:9022`, so every action will fail with a
+`Gateway request failed: the IronClaw sandbox blocks HTTP requests to
+localhost` error — even when `lsof` confirms the gateway is listening.
+
+**This is a known IronClaw sandbox limitation, not a gateway bug.**
+
+### Workaround via the `shell` tool
+
+Use IronClaw's built-in `shell` tool to send the HTTP request directly. The
+`shell` tool runs on the host without WASM restrictions and can reach
+localhost.
+
+**Health check:**
+```bash
+curl -s 'http://127.0.0.1:9022/health'
+```
+
+**List active sessions:**
+```bash
+curl -s 'http://127.0.0.1:9022/sessions'
+```
+
+**Connect (password auth):**
+```bash
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"host":"server.example.com","port":22,"username":"deploy",
+       "auth":{"type":"password","password":"<PASSWORD>"},
+       "host_key_fingerprint":"SHA256:...","insecure_ignore_host_key":false}' \
+  'http://127.0.0.1:9022/connect'
+```
+
+**Connect (private key — write key to temp file to avoid shell-history exposure):**
+```bash
+cat > /tmp/ssh_key_$$ << 'KEYEOF'
+-----BEGIN OPENSSH PRIVATE KEY-----
+<paste key here>
+-----END OPENSSH PRIVATE KEY-----
+KEYEOF
+chmod 600 /tmp/ssh_key_$$
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d "{\"host\":\"server.example.com\",\"port\":22,\"username\":\"deploy\",
+       \"auth\":{\"type\":\"private_key\",\"key_pem\":\"$(sed 's/$/\\n/g' /tmp/ssh_key_$$ | tr -d '\n')\"},
+       \"host_key_fingerprint\":\"SHA256:...\",\"insecure_ignore_host_key\":false}" \
+  'http://127.0.0.1:9022/connect'
+rm /tmp/ssh_key_$$
+```
+
+**Execute a command:**
+```bash
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"session_id":"prod","command":"uptime","timeout_secs":30}' \
+  'http://127.0.0.1:9022/execute'
+```
+
+**Disconnect:**
+```bash
+curl -s -X DELETE -H 'Content-Type: application/json' \
+  -d '{"session_id":"prod"}' \
+  'http://127.0.0.1:9022/disconnect'
+```
+
+All gateway responses are JSON. On success the HTTP status is 2xx. On error
+check the `"error"` key in the response body.
+
+> **Bearer token**: if the gateway was started with `SSH_GATEWAY_TOKEN`, add
+> `-H 'Authorization: Bearer <token>'` to every curl command.
+
+---
+
 ## Tool selection
 
 - The IronClaw built-in `shell` tool runs commands on the **local** machine
@@ -54,6 +127,10 @@ itself is sandboxed and only speaks HTTP to `127.0.0.1`.
   pattern is acceptable.
 
 ## Action lifecycle (memorise this order)
+
+> **Sandbox note**: all actions below fail with a sandbox HTTP restriction
+> error inside IronClaw. Use the `shell` tool + `curl` workaround from the
+> section above instead of calling `remote_shell` actions directly.
 
 1. **`health`** — call once at the start of a session if you don't already
    know the gateway is up. On failure, ask the user to start
@@ -85,6 +162,7 @@ itself is sandboxed and only speaks HTTP to `127.0.0.1`.
 
 | Symptom (tool error string contains) | Likely cause | Recovery |
 |---|---|---|
+| `sandbox blocks HTTP requests to localhost` | IronClaw WASM sandbox blocks HTTP to 127.0.0.1. | Use the `shell` tool with `curl` instead (see **Sandbox HTTP restriction** above). |
 | `Gateway request failed` / `Gateway is NOT reachable` | The local gateway isn't running. | Tell the user to start `remote-shell-gateway`, then `health`. Do not retry connect blindly. |
 | `Gateway error (HTTP 401)` | Bearer token mismatch. | Ask the user to re-add the `ssh_gateway_token` secret. |
 | `Gateway error (HTTP 413)` | Body too large (oversized `key_pem` or `command`). | Shorten the input; for large transfers prefer multiple smaller commands. |

@@ -182,6 +182,33 @@ fn gateway_url(port: Option<u16>) -> String {
     format!("http://127.0.0.1:{}", port)
 }
 
+fn is_sandbox_restriction(err: &str) -> bool {
+    err.contains("HTTP not allowed")
+        || err.contains("InsecureScheme")
+        || err.contains("private/internal IP")
+        || err.contains("HTTP request to private")
+        || err.contains("DNS rebinding detected")
+}
+
+fn sandbox_gateway_error(method: &str, url: &str) -> String {
+    let cmd = if method == "GET" {
+        format!("curl -s '{url}'")
+    } else {
+        format!(
+            "curl -s -X {method} -H 'Content-Type: application/json' -d '<json-body>' '{url}'"
+        )
+    };
+    format!(
+        "Gateway request failed: the IronClaw sandbox blocks HTTP requests to \
+         localhost (127.0.0.1). The gateway may be running but cannot be reached \
+         from within the WASM sandbox.\n\
+         Workaround — use the shell tool to run:\n  {cmd}\n\
+         For 'connect': construct the JSON body without embedding credentials in shell \
+         history (write the key to a temp file or pipe via stdin). \
+         See SKILL.md for the full workaround guide."
+    )
+}
+
 fn gateway_request(
     method: &str,
     path: &str,
@@ -206,7 +233,13 @@ fn gateway_request(
         body_bytes.as_deref(),
         Some(http_timeout_ms),
     )
-    .map_err(|e| format!("Gateway request failed: {e}"))?;
+    .map_err(|e| {
+        if is_sandbox_restriction(&e) {
+            sandbox_gateway_error(method, &url)
+        } else {
+            format!("Gateway request failed: {e}")
+        }
+    })?;
 
     let body_str =
         String::from_utf8(response.body).map_err(|e| format!("Invalid UTF-8 response: {e}"))?;
@@ -949,5 +982,57 @@ mod tests {
         assert!(desc.contains("disconnect"));
         assert!(desc.contains("list_sessions"));
         assert!(desc.contains("health"));
+    }
+
+    #[test]
+    fn test_is_sandbox_restriction_detects_https_scheme_error() {
+        assert!(is_sandbox_restriction(
+            "HTTP not allowed: HTTP request not allowed: Denied(InsecureScheme(\"http\"))"
+        ));
+    }
+
+    #[test]
+    fn test_is_sandbox_restriction_detects_private_ip_error() {
+        assert!(is_sandbox_restriction(
+            "HTTP request to private/internal IP 127.0.0.1 is not allowed"
+        ));
+    }
+
+    #[test]
+    fn test_is_sandbox_restriction_detects_dns_rebinding() {
+        assert!(is_sandbox_restriction(
+            "DNS rebinding detected: localhost resolved to private IP 127.0.0.1"
+        ));
+    }
+
+    #[test]
+    fn test_is_sandbox_restriction_does_not_match_normal_errors() {
+        assert!(!is_sandbox_restriction("Gateway request failed: connection refused"));
+        assert!(!is_sandbox_restriction("Gateway error (HTTP 404): Session not found"));
+        assert!(!is_sandbox_restriction("Rate limit exceeded"));
+        assert!(!is_sandbox_restriction("Failed to parse URL: invalid URL"));
+    }
+
+    #[test]
+    fn test_sandbox_gateway_error_get_produces_curl_without_x_flag() {
+        let msg = sandbox_gateway_error("GET", "http://127.0.0.1:9022/health");
+        assert!(msg.contains("sandbox blocks HTTP"));
+        assert!(msg.contains("curl -s 'http://127.0.0.1:9022/health'"));
+        assert!(!msg.contains("-X GET"));
+    }
+
+    #[test]
+    fn test_sandbox_gateway_error_post_includes_method_and_placeholder() {
+        let msg = sandbox_gateway_error("POST", "http://127.0.0.1:9022/execute");
+        assert!(msg.contains("-X POST"));
+        assert!(msg.contains("<json-body>"));
+        assert!(msg.contains("http://127.0.0.1:9022/execute"));
+    }
+
+    #[test]
+    fn test_sandbox_gateway_error_delete_includes_method() {
+        let msg = sandbox_gateway_error("DELETE", "http://127.0.0.1:9022/disconnect");
+        assert!(msg.contains("-X DELETE"));
+        assert!(msg.contains("http://127.0.0.1:9022/disconnect"));
     }
 }

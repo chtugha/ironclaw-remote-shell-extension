@@ -422,10 +422,41 @@ reconnecting with the same `session_id` is the recommended recovery.
 
 ---
 
+## Known Limitation — IronClaw Sandbox HTTP Restriction
+
+IronClaw's WASM sandbox **blocks all HTTP requests to `127.0.0.1`** at two
+independent layers (HTTPS-only scheme check and loopback-IP SSRF guard). This
+means every `remote_shell` action will fail with:
+
+```
+Gateway request failed: the IronClaw sandbox blocks HTTP requests to localhost (127.0.0.1).
+The gateway may be running but cannot be reached from within the WASM sandbox.
+Workaround — use the shell tool to run:
+  curl -s 'http://127.0.0.1:9022/health'
+```
+
+**This is a structural sandbox constraint, not a bug in the gateway or tool.**
+
+### Workaround
+
+Use IronClaw's built-in `shell` tool to send `curl` commands directly to the
+gateway. The `shell` tool runs on the host without WASM restrictions. See
+`skills/remote-shell/SKILL.md` for the complete set of ready-to-paste `curl`
+commands for each action (`connect`, `execute`, `disconnect`, `list_sessions`,
+`health`).
+
+> This limitation requires an upstream IronClaw change to expose an
+> `allow_loopback_http` capabilities flag (the `AllowlistValidator::allow_http()`
+> method already exists in IronClaw but is not wired to any capabilities JSON
+> field). A PR to the IronClaw repository would be the long-term fix.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| `sandbox blocks HTTP requests to localhost` | IronClaw WASM sandbox blocks HTTP to 127.0.0.1 — structural limitation. | Use the `shell` tool with `curl` instead; see **Known Limitation** above and `SKILL.md`. |
 | `Gateway request failed` | The local gateway isn't running, or is on a different port. | Run `health`. If it still fails, start `remote-shell-gateway`. |
 | `Gateway error (HTTP 401)` | Bearer-token mismatch between IronClaw secret and gateway env var. | Re-paste `ssh_gateway_token` in IronClaw, or restart the gateway with the matching token. |
 | `Gateway error (HTTP 404): Session 'X' not found` | Session was reaped (TTL elapsed) or never existed. | Reconnect using the same `session_id`. |
@@ -438,6 +469,18 @@ reconnecting with the same `session_id` is the recommended recovery.
 ---
 
 ## Changelog
+
+### 0.1.2 — Sandbox diagnostics
+
+**Diagnostics**
+- WASM tool now detects when the IronClaw sandbox blocks the HTTP call to
+  localhost and returns an actionable error with the equivalent `curl` command
+  to run via the `shell` tool.
+- `SKILL.md` updated with sandbox workaround guide (complete curl commands for
+  every action, private-key temp-file pattern).
+- `README.md` documents the IronClaw sandbox HTTP restriction as a known
+  limitation with root-cause analysis and upstream fix reference.
+- 7 new tests covering `is_sandbox_restriction` and `sandbox_gateway_error`.
 
 ### 0.1.1 — Hardening pass
 
