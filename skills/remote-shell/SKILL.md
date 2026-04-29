@@ -78,7 +78,7 @@ curl -s -X POST -H 'Content-Type: application/json' \
   'http://127.0.0.1:9022/connect'
 ```
 
-**Connect (private key — write key to temp file to avoid shell-history exposure):**
+**Connect (private key — use temp files so the key never appears in curl arguments or process listings):**
 ```bash
 cat > /tmp/ssh_key_$$ << 'KEYEOF'
 -----BEGIN OPENSSH PRIVATE KEY-----
@@ -86,12 +86,16 @@ cat > /tmp/ssh_key_$$ << 'KEYEOF'
 -----END OPENSSH PRIVATE KEY-----
 KEYEOF
 chmod 600 /tmp/ssh_key_$$
+python3 -c "
+import json, sys
+key = open('/tmp/ssh_key_$$').read()
+print(json.dumps({'host':'server.example.com','port':22,'username':'deploy',
+  'auth':{'type':'private_key','key_pem':key},
+  'host_key_fingerprint':'SHA256:...','insecure_ignore_host_key':False}))
+" > /tmp/ssh_body_$$
 curl -s -X POST -H 'Content-Type: application/json' \
-  -d "{\"host\":\"server.example.com\",\"port\":22,\"username\":\"deploy\",
-       \"auth\":{\"type\":\"private_key\",\"key_pem\":\"$(sed 's/$/\\n/g' /tmp/ssh_key_$$ | tr -d '\n')\"},
-       \"host_key_fingerprint\":\"SHA256:...\",\"insecure_ignore_host_key\":false}" \
-  'http://127.0.0.1:9022/connect'
-rm /tmp/ssh_key_$$
+  -d @/tmp/ssh_body_$$ 'http://127.0.0.1:9022/connect'
+rm /tmp/ssh_key_$$ /tmp/ssh_body_$$
 ```
 
 **Execute a command:**

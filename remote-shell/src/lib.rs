@@ -485,6 +485,7 @@ fn execute_inner(params: &str) -> Result<String, String> {
                     "Gateway is reachable at {}.",
                     gateway_url(gateway_port)
                 )),
+                Err(e) if is_sandbox_restriction(&e) => Err(e),
                 Err(e) => Err(format!(
                     "Gateway is NOT reachable at {}. Start it with `remote-shell-gateway` (see README). Detail: {e}",
                     gateway_url(gateway_port)
@@ -982,6 +983,11 @@ mod tests {
         assert!(desc.contains("disconnect"));
         assert!(desc.contains("list_sessions"));
         assert!(desc.contains("health"));
+    }
+
+    #[test]
+    fn test_is_sandbox_restriction_detects_http_not_allowed_prefix_alone() {
+        assert!(is_sandbox_restriction("HTTP not allowed: blocked by policy"));
     }
 
     #[test]
