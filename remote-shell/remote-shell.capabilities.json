@@ -16,62 +16,37 @@
     "notes": [
       "WARNING: The IronClaw WASM sandbox blocks all HTTP to 127.0.0.1 — every remote_shell action fails with a sandbox restriction error. Use the built-in shell tool with curl instead. See SKILL.md for ready-to-paste curl commands for every action.",
       "The SSH gateway service (`remote-shell-gateway`) must be running locally. Default port is 9022; override with `gateway_port`.",
-      "Sessions persist until explicitly disconnected or the gateway TTL elapses (default 3600s). Reuse `session_id` across many commands — do NOT reconnect for every command.",
+      "Sessions persist until explicitly disconnected, the gateway TTL elapses (default 3600s), or the gateway is restarted (all sessions are in-memory). Reuse `session_id` across many commands — do NOT reconnect for every command.",
       "Stdout / stderr are capped at 10 MB each; output beyond that is truncated.",
       "Use `tool_info(name: \"remote_shell\", detail: \"schema\")` for the full action schema."
     ],
-    "examples": [
-      {
-        "action": "health"
-      },
-      {
-        "action": "connect",
-        "host": "server.example.com",
-        "username": "deploy",
-        "auth": { "type": "password", "password": "..." },
-        "host_key_fingerprint": "SHA256:..."
-      },
-      {
-        "action": "execute",
-        "session_id": "abc-123",
-        "command": "uptime"
-      },
-      {
-        "action": "list_sessions"
-      },
-      {
-        "action": "disconnect",
-        "session_id": "abc-123"
-      }
-    ]
+    "examples": []
   },
-  "capabilities": {
-    "http": {
-      "allowlist": [
-        {
-          "host": "127.0.0.1",
-          "path_prefix": "/",
-          "methods": ["GET", "POST", "DELETE"]
-        }
-      ],
-      "credentials": {
-        "ssh_gateway_token": {
-          "secret_name": "ssh_gateway_token",
-          "location": { "type": "bearer" },
-          "host_patterns": ["127.0.0.1"]
-        }
-      },
-      "rate_limit": {
-        "requests_per_minute": 60,
-        "requests_per_hour": 1000
+  "http": {
+    "allowlist": [
+      {
+        "host": "127.0.0.1",
+        "path_prefix": "/",
+        "methods": ["GET", "POST", "DELETE"]
+      }
+    ],
+    "credentials": {
+      "ssh_gateway_token": {
+        "secret_name": "ssh_gateway_token",
+        "location": { "type": "bearer" },
+        "host_patterns": ["127.0.0.1"]
       }
     },
-    "secrets": {
-      "allowed_names": [
-        "ssh_gateway_token",
-        "ssh_*"
-      ]
+    "rate_limit": {
+      "requests_per_minute": 60,
+      "requests_per_hour": 1000
     }
+  },
+  "secrets": {
+    "allowed_names": [
+      "ssh_gateway_token",
+      "ssh_*"
+    ]
   },
   "auth": {
     "secret_name": "ssh_gateway_token",
