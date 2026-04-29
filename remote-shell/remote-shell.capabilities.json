@@ -58,11 +58,7 @@
       "credentials": {
         "ssh_gateway_token": {
           "secret_name": "ssh_gateway_token",
-          "location": {
-            "type": "header",
-            "name": "Authorization",
-            "prefix": "Bearer "
-          },
+          "location": { "type": "bearer" },
           "host_patterns": ["127.0.0.1"]
         }
       },
@@ -92,9 +88,5 @@
         "prompt": "SSH gateway bearer token (optional, press Enter to skip)"
       }
     ]
-  },
-  "config": {
-    "default_gateway_port": 9022,
-    "default_timeout_secs": 30
   }
 }
