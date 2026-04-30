@@ -26,7 +26,31 @@ The WASM sandbox cannot open raw TCP connections, so the extension uses a two-co
 
 ---
 
-## Installation on Debian
+## Quick Install
+
+If you have Rust (with `rustup`), the `ironclaw` CLI, and `sudo` access, run:
+
+```bash
+git clone https://github.com/chtugha/ironclaw-remote-shell-extension
+cd ironclaw-remote-shell-extension
+./install.sh
+```
+
+The script automatically:
+
+- Detects and stops a running gateway (systemd service or standalone process)
+- Builds the gateway binary and the WASM tool from source
+- Installs the gateway to `/usr/local/bin/remote-shell-gateway` (requires `sudo`)
+- Installs (or updates) the WASM tool via `ironclaw tool install`
+- Copies (or overwrites) the companion skill to `~/.ironclaw/skills/remote-shell/`
+- Restarts the gateway service if a systemd unit exists
+
+After the script finishes, configure the bearer token (if used) and you are
+ready to go — see steps 9 and 10 in the manual installation section below.
+
+---
+
+## Manual Installation on Debian
 
 ### 1 — Install build dependencies
 
@@ -469,6 +493,14 @@ commands for each action (`connect`, `execute`, `disconnect`, `list_sessions`,
 ---
 
 ## Changelog
+
+### 0.1.3 — Install script
+
+- Added `install.sh` that automates the full build-and-install workflow:
+  detects and stops a running gateway, builds both components from source,
+  installs the gateway binary, the WASM tool, and the companion skill, then
+  restarts the gateway. Handles both fresh installs and updates.
+- README updated with a Quick Install section.
 
 ### 0.1.2 — Sandbox diagnostics
 
