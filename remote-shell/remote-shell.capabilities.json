@@ -7,11 +7,12 @@
       "action"
     ],
     "conditional_requirements": [
-      "`connect` requires `host`, `username`, `auth`, and either `host_key_fingerprint` (SHA256:... for MITM protection, obtain with: ssh-keyscan <host> | ssh-keygen -lf -) or `insecure_ignore_host_key: true` (skips verification, only for trusted networks).",
-      "`execute` requires `session_id` and `command`. `timeout_secs` (1-3600, default 30) is optional.",
-      "`disconnect` requires `session_id`.",
-      "`list_sessions` has no additional requirements.",
-      "`health` has no additional requirements; it probes the local gateway."
+      "Do NOT call remote_shell actions directly — the WASM sandbox blocks all HTTP to localhost. Use the built-in shell tool with curl to talk to the gateway at http://127.0.0.1:9022. See SKILL.md for ready-to-paste curl commands.",
+      "connect (via curl POST /connect): requires host, username, auth, and either host_key_fingerprint (SHA256:...) or insecure_ignore_host_key: true.",
+      "execute (via curl POST /execute): requires session_id and command. timeout_secs (1-3600, default 30) is optional.",
+      "disconnect (via curl DELETE /disconnect): requires session_id.",
+      "list sessions (via curl GET /sessions): no additional requirements.",
+      "health (via curl GET /health): no additional requirements; probes the local gateway."
     ],
     "notes": [
       "WARNING: The IronClaw WASM sandbox blocks all HTTP to 127.0.0.1 — every remote_shell action fails with a sandbox restriction error. Use the built-in shell tool with curl instead. See SKILL.md for ready-to-paste curl commands for every action.",

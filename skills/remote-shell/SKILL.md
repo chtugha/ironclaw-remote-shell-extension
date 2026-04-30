@@ -39,9 +39,10 @@ activation:
 # remote-shell Best Practices
 
 Use this skill whenever the user wants to operate on a **remote** machine over
-SSH. The `remote_shell` tool talks to a local gateway service
-(`remote-shell-gateway`) which holds the actual SSH connections; the tool
-itself is sandboxed and only speaks HTTP to `127.0.0.1`.
+SSH. A local gateway service (`remote-shell-gateway`) holds the actual SSH
+connections. The WASM `remote_shell` tool cannot reach the gateway due to
+sandbox restrictions — **always use the built-in `shell` tool with `curl`**
+to talk to the gateway instead of invoking `remote_shell` actions directly.
 
 ## Sandbox HTTP restriction (read this first)
 
@@ -123,12 +124,13 @@ check the `"error"` key in the response body.
 ## Tool selection
 
 - The IronClaw built-in `shell` tool runs commands on the **local** machine
-  (where IronClaw is running). Use it for the user's own repo, builds, tests.
-- `remote_shell` runs commands on **another** machine over SSH. Use it only
-  when the host is genuinely remote.
-- Never SCP or rsync files using `remote_shell.execute "cat … | base64"` if a
-  proper file-transfer tool is available — but for small text files that
-  pattern is acceptable.
+  (where IronClaw is running). Use it for the user's own repo, builds, tests,
+  **and for all gateway interactions via `curl`** (see above).
+- The `remote_shell` WASM tool is non-functional inside the sandbox — do NOT
+  call it directly. Use `shell` + `curl` to the gateway instead.
+- Never SCP or rsync files using `execute "cat … | base64"` if a proper
+  file-transfer tool is available — but for small text files that pattern is
+  acceptable.
 
 ## Action lifecycle (conceptual — execute via curl, not direct tool calls)
 
