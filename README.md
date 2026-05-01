@@ -312,8 +312,10 @@ edit it instead:
 # Check current value:
 grep ALLOW_LOCAL_TOOLS ~/.ironclaw/.env
 
-# Update it:
+# Update it (Linux):
 sed -i 's/^ALLOW_LOCAL_TOOLS=.*/ALLOW_LOCAL_TOOLS=true/' ~/.ironclaw/.env
+# Update it (macOS):
+sed -i '' 's/^ALLOW_LOCAL_TOOLS=.*/ALLOW_LOCAL_TOOLS=true/' ~/.ironclaw/.env
 ```
 
 ### Step 10 — Install the companion skill
@@ -510,7 +512,10 @@ echo "ALLOW_LOCAL_TOOLS=true" >> ~/.ironclaw/.env
 If the file already has `ALLOW_LOCAL_TOOLS` set to something else:
 
 ```bash
+# Linux:
 sed -i 's/^ALLOW_LOCAL_TOOLS=.*/ALLOW_LOCAL_TOOLS=true/' ~/.ironclaw/.env
+# macOS:
+sed -i '' 's/^ALLOW_LOCAL_TOOLS=.*/ALLOW_LOCAL_TOOLS=true/' ~/.ironclaw/.env
 ```
 
 Verify the setting is in place:
@@ -908,8 +913,7 @@ Opens a new SSH session.
 | `session_id` | string | no | A name for this session. Auto-generated UUID if omitted. |
 
 > Either `host_key_fingerprint` **or** `insecure_ignore_host_key: true` is
-> required. Omitting both is rejected by the WASM tool before any network
-> call is made.
+> required. Omitting both is rejected by the **gateway** with `HTTP 400`.
 
 **`auth` object (password):**
 
@@ -1028,8 +1032,8 @@ Common HTTP status codes:
 
 ### Using a gateway on a non-default port
 
-If the gateway was started with `--port 9100`, pass `gateway_port` in the
-WASM tool's JSON (for schema-aware calls) or simply change the URL in curl:
+If the gateway was started with `--port 9100`, change the port in the curl
+URL:
 
 ```bash
 curl -s 'http://127.0.0.1:9100/health'
