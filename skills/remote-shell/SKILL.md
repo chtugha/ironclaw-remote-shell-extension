@@ -44,6 +44,21 @@ connections. The WASM `remote_shell` tool cannot reach the gateway due to
 sandbox restrictions — **always use the built-in `shell` tool with `curl`**
 to talk to the gateway instead of invoking `remote_shell` actions directly.
 
+## Prerequisites
+
+The `shell` tool is only available when IronClaw is started with
+`ALLOW_LOCAL_TOOLS=true` (or when builder mode is enabled). Without it,
+the extension cannot function because the WASM sandbox blocks all HTTP to
+localhost and there is no alternative path to the gateway.
+
+If you get `Tool error: Tool shell not found`, tell the user:
+
+> The `shell` tool is not available. Add `ALLOW_LOCAL_TOOLS=true` to your
+> IronClaw environment (e.g. in `~/.ironclaw/.env`) and restart IronClaw.
+
+Do NOT attempt to call `remote_shell` actions directly — they will always
+fail with a sandbox restriction error regardless of `ALLOW_LOCAL_TOOLS`.
+
 ## Sandbox HTTP restriction (read this first)
 
 IronClaw's WASM sandbox **blocks all HTTP requests to `127.0.0.1`** (both
@@ -58,7 +73,7 @@ localhost` error — even when `lsof` confirms the gateway is listening.
 
 Use IronClaw's built-in `shell` tool to send the HTTP request directly. The
 `shell` tool runs on the host without WASM restrictions and can reach
-localhost.
+localhost. The `shell` tool requires `ALLOW_LOCAL_TOOLS=true`.
 
 **Health check:**
 ```bash
@@ -125,9 +140,13 @@ check the `"error"` key in the response body.
 
 - The IronClaw built-in `shell` tool runs commands on the **local** machine
   (where IronClaw is running). Use it for the user's own repo, builds, tests,
-  **and for all gateway interactions via `curl`** (see above).
+  **and for all gateway interactions via `curl`** (see above). Requires
+  `ALLOW_LOCAL_TOOLS=true`.
 - The `remote_shell` WASM tool is non-functional inside the sandbox — do NOT
   call it directly. Use `shell` + `curl` to the gateway instead.
+- If the `shell` tool is not available (`Tool error: Tool shell not found`),
+  the extension cannot function. Instruct the user to set
+  `ALLOW_LOCAL_TOOLS=true` and restart IronClaw.
 - Never SCP or rsync files using `execute "cat … | base64"` if a proper
   file-transfer tool is available — but for small text files that pattern is
   acceptable.
@@ -166,6 +185,7 @@ the Sandbox section above via the shell tool.**
 
 | Symptom (tool error string contains) | Likely cause | Recovery |
 |---|---|---|
+| `Tool shell not found` | `ALLOW_LOCAL_TOOLS=true` is not set. The `shell` tool is not registered. | Tell the user to add `ALLOW_LOCAL_TOOLS=true` to `~/.ironclaw/.env` and restart IronClaw. |
 | `sandbox blocks HTTP requests to localhost` | IronClaw WASM sandbox blocks HTTP to 127.0.0.1. | Use the `shell` tool with `curl` instead (see **Sandbox HTTP restriction** above). |
 | `Gateway request failed` / `Gateway is NOT reachable` | The local gateway isn't running. | Tell the user to start `remote-shell-gateway`, then `health`. Do not retry connect blindly. |
 | `Gateway error (HTTP 401)` | Bearer token mismatch. | Ask the user to re-add the `ssh_gateway_token` secret. |

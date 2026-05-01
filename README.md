@@ -43,10 +43,12 @@ The script automatically:
 - Installs the gateway to `/usr/local/bin/remote-shell-gateway` (requires `sudo`)
 - Installs (or updates) the WASM tool via `ironclaw tool install`
 - Copies (or overwrites) the companion skill to `~/.ironclaw/skills/remote-shell/`
+- Sets `ALLOW_LOCAL_TOOLS=true` in `~/.ironclaw/.env` (required — see below)
 - Restarts the gateway service if a systemd unit exists
 
-After the script finishes, configure the bearer token (if used) and you are
-ready to go — see steps 9 and 10 in the manual installation section below.
+After the script finishes, **restart IronClaw** so it picks up the new tool,
+skill, and `ALLOW_LOCAL_TOOLS` setting. Then configure the bearer token (if
+used) — see steps 9 and 10 in the manual installation section below.
 
 ---
 
@@ -115,7 +117,18 @@ ironclaw tool install \
 
 Restart IronClaw so it picks up the new tool.
 
-### 8a — Install the companion skill (recommended)
+### 8a — Enable local tools (required)
+
+The extension communicates with the gateway via the `shell` tool and `curl`.
+The `shell` tool is only available when `ALLOW_LOCAL_TOOLS=true`:
+
+```bash
+echo "ALLOW_LOCAL_TOOLS=true" >> ~/.ironclaw/.env
+```
+
+If the file already exists with a different value, update it instead.
+
+### 8b — Install the companion skill (recommended)
 
 The repository ships with a `remote-shell` skill that teaches the agent how
 to use this tool safely (lifecycle, security rules, failure-mode recovery).
@@ -469,6 +482,17 @@ gateway. The `shell` tool runs on the host without WASM restrictions. See
 commands for each action (`connect`, `execute`, `disconnect`, `list_sessions`,
 `health`).
 
+**The `shell` tool requires `ALLOW_LOCAL_TOOLS=true`** in IronClaw's
+environment. Without this setting, the `shell` tool is not registered and
+the extension has no viable path to reach the gateway. Add the following
+to `~/.ironclaw/.env`:
+
+```
+ALLOW_LOCAL_TOOLS=true
+```
+
+Then restart IronClaw. The `install.sh` script sets this automatically.
+
 > This limitation requires an upstream IronClaw change to expose an
 > `allow_loopback_http` capabilities flag (the `AllowlistValidator::allow_http()`
 > method already exists in IronClaw but is not wired to any capabilities JSON
@@ -480,6 +504,7 @@ commands for each action (`connect`, `execute`, `disconnect`, `list_sessions`,
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| `Tool shell not found` | `ALLOW_LOCAL_TOOLS=true` is not set in IronClaw's environment. | Add `ALLOW_LOCAL_TOOLS=true` to `~/.ironclaw/.env` and restart IronClaw. |
 | `sandbox blocks HTTP requests to localhost` | IronClaw WASM sandbox blocks HTTP to 127.0.0.1 — structural limitation. | Use the `shell` tool with `curl` instead; see **Known Limitation** above and `SKILL.md`. |
 | `Gateway request failed` | The local gateway isn't running, or is on a different port. | Run `health`. If it still fails, start `remote-shell-gateway`. |
 | `Gateway error (HTTP 401)` | Bearer-token mismatch between IronClaw secret and gateway env var. | Re-paste `ssh_gateway_token` in IronClaw, or restart the gateway with the matching token. |
@@ -493,6 +518,22 @@ commands for each action (`connect`, `execute`, `disconnect`, `list_sessions`,
 ---
 
 ## Changelog
+
+### 0.1.4 — ALLOW_LOCAL_TOOLS prerequisite
+
+- Root-caused `Tool shell not found` error: IronClaw's `shell` tool requires
+  `ALLOW_LOCAL_TOOLS=true` (env var, defaults to `false`). Without it the
+  `shell` tool is never registered and the extension has no viable path to
+  the gateway (WASM sandbox blocks localhost HTTP, `http` builtin also blocks
+  loopback IPs).
+- `install.sh` now sets `ALLOW_LOCAL_TOOLS=true` in `~/.ironclaw/.env`
+  automatically.
+- `SKILL.md` updated with a Prerequisites section, failure-mode entry for
+  `Tool shell not found`, and `ALLOW_LOCAL_TOOLS` references throughout.
+- `capabilities.json` discovery WARNING updated with the prerequisite.
+- `README.md` updated: Quick Install mentions the setting, manual install
+  adds step 8a, troubleshooting table includes the new error, Known
+  Limitation section documents the `ALLOW_LOCAL_TOOLS` requirement.
 
 ### 0.1.3 — Install script
 

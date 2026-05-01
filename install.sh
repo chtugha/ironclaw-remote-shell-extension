@@ -123,6 +123,28 @@ install_skill() {
     ok "Skill installed to ${SKILL_DIR}/SKILL.md"
 }
 
+ensure_allow_local_tools() {
+    local env_file="${HOME}/.ironclaw/.env"
+
+    if grep -qE '^ALLOW_LOCAL_TOOLS="?true"?' "${env_file}" 2>/dev/null; then
+        ok "ALLOW_LOCAL_TOOLS=true already set in ${env_file}"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "${env_file}")"
+
+    if [ -f "${env_file}" ] && grep -qE '^ALLOW_LOCAL_TOOLS=' "${env_file}"; then
+        sed -i.bak 's/^ALLOW_LOCAL_TOOLS=.*/ALLOW_LOCAL_TOOLS=true/' "${env_file}"
+        rm -f "${env_file}.bak"
+        info "Updated ALLOW_LOCAL_TOOLS=true in ${env_file}"
+    else
+        echo "ALLOW_LOCAL_TOOLS=true" >> "${env_file}"
+        info "Added ALLOW_LOCAL_TOOLS=true to ${env_file}"
+    fi
+
+    ok "ALLOW_LOCAL_TOOLS=true configured (required for the shell tool)."
+}
+
 print_summary() {
     echo ""
     echo "============================================"
@@ -139,7 +161,11 @@ print_summary() {
         echo "  Start gateway  : ${GATEWAY_BIN_NAME}"
     fi
     echo ""
-    echo "  Configure auth : ironclaw tool auth ${TOOL_NAME}"
+    echo "  ALLOW_LOCAL_TOOLS : true (in ~/.ironclaw/.env)"
+    echo "  Configure auth   : ironclaw tool auth ${TOOL_NAME}"
+    echo ""
+    echo "  NOTE: Restart IronClaw after installation so it picks up"
+    echo "        the new tool, skill, and ALLOW_LOCAL_TOOLS setting."
     echo ""
 }
 
@@ -169,6 +195,8 @@ main() {
     install_wasm_tool
 
     install_skill
+
+    ensure_allow_local_tools
 
     start_gateway
 

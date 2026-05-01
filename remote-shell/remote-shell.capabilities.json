@@ -7,7 +7,7 @@
       "action"
     ],
     "conditional_requirements": [
-      "Do NOT call remote_shell actions directly — the WASM sandbox blocks all HTTP to localhost. Use the built-in shell tool with curl to talk to the gateway at http://127.0.0.1:9022. See SKILL.md for ready-to-paste curl commands.",
+      "Do NOT call remote_shell actions directly — the WASM sandbox blocks all HTTP to localhost. Use the built-in shell tool (requires ALLOW_LOCAL_TOOLS=true) with curl to talk to the gateway at http://127.0.0.1:9022. See SKILL.md for ready-to-paste curl commands.",
       "connect (via curl POST /connect): requires host, username, auth, and either host_key_fingerprint (SHA256:...) or insecure_ignore_host_key: true.",
       "execute (via curl POST /execute): requires session_id and command. timeout_secs (1-3600, default 30) is optional.",
       "disconnect (via curl DELETE /disconnect): requires session_id.",
@@ -15,7 +15,7 @@
       "health (via curl GET /health): no additional requirements; probes the local gateway."
     ],
     "notes": [
-      "WARNING: The IronClaw WASM sandbox blocks all HTTP to 127.0.0.1 — every remote_shell action fails with a sandbox restriction error. Use the built-in shell tool with curl instead. See SKILL.md for ready-to-paste curl commands for every action.",
+      "WARNING: The IronClaw WASM sandbox blocks all HTTP to 127.0.0.1 — every remote_shell action fails with a sandbox restriction error. Use the built-in shell tool with curl instead (requires ALLOW_LOCAL_TOOLS=true). If you get 'Tool shell not found', tell the user to add ALLOW_LOCAL_TOOLS=true to ~/.ironclaw/.env and restart IronClaw. See SKILL.md for ready-to-paste curl commands.",
       "The SSH gateway service (`remote-shell-gateway`) must be running locally. Default port is 9022; override with `gateway_port`.",
       "Sessions persist until explicitly disconnected, the gateway TTL elapses (default 3600s), or the gateway is restarted (all sessions are in-memory). Reuse `session_id` across many commands — do NOT reconnect for every command.",
       "Stdout / stderr are capped at 10 MB each; output beyond that is truncated.",
